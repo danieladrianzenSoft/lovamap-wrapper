@@ -1,6 +1,5 @@
 using Microsoft.EntityFrameworkCore;
 using WrapperApi.Data;
-using WrapperApi.Helpers;
 using WrapperApi.Models;
 using WrapperApi.Services;
 
@@ -32,11 +31,15 @@ builder.Services.AddSingleton<JobService>(provider =>
 {
     var scopeFactory = provider.GetRequiredService<IServiceScopeFactory>();
     var env = provider.GetRequiredService<IWebHostEnvironment>();
-    return new JobService(scopeFactory, env, inputDir, outputDir);
+    var cache = provider.GetRequiredService<HeartbeatCache>();
+    return new JobService(scopeFactory, env, cache, inputDir, outputDir);
 });
 
 builder.Services.AddSingleton<IBackgroundJobQueue, BackgroundJobQueue>();
+builder.Services.AddSingleton<HeartbeatCache>();
+
 builder.Services.AddHostedService<BackgroundJobService>();
+builder.Services.AddHostedService<HeartbeatFlusherService>();
 
 var app = builder.Build();
 
@@ -126,7 +129,8 @@ app.MapPost("/jobs", async (
 		JobId = jobId,
         FileName = fileName,
         Status = JobStatus.Pending,
-        SubmittedAt = DateTime.UtcNow
+        SubmittedAt = DateTime.UtcNow,
+        DxValue = dxValue,
     };
 
     db.Jobs.Add(job);
@@ -173,6 +177,45 @@ app.MapDelete("/jobs", async (HttpRequest request, DataContext db) =>
         DeletedOutputDirs = outputDirDeleteCount,
         Cutoff = start
     });
+});
+
+app.MapPost("/heartbeat", async (HttpRequest request, HeartbeatCache cache) =>
+{
+    var heartbeatToken = request.Headers["X-Heartbeat-Token"].ToString();
+    if (!request.HasFormContentType)
+    {
+        return Results.BadRequest("Content-Type must be application/x-www-form-urlencoded");
+    }
+
+    IFormCollection form;
+    try
+    {
+        form = await request.ReadFormAsync();
+    }
+    catch (Exception ex)
+    {
+        return Results.BadRequest("Invalid or missing form data.");
+    }
+
+    var jobId = form["jobId"].ToString();
+    var description = form["desc"].ToString();
+
+    if (string.IsNullOrEmpty(jobId))
+    {
+        Console.WriteLine($"Missing jobId");
+        return Results.BadRequest("Missing jobId");
+    }
+
+    if (string.IsNullOrEmpty(description))
+    {
+        Console.WriteLine($"Missing description");
+        return Results.BadRequest("Missing 'desc'");
+    }
+    
+    cache.Update(jobId, description);
+    Console.WriteLine($"[HEARTBEAT] Job {jobId}: {description} at {DateTime.UtcNow}");
+
+    return Results.Ok();
 });
 
 app.Run();

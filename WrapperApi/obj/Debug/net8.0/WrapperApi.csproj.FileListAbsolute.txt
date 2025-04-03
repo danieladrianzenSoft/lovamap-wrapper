@@ -151,3 +151,4 @@
 /Users/dzen/Documents/LOVAMAP/LOVAMAP_Core/lovamap-wrapper/WrapperApi/obj/Debug/net8.0/WrapperApi.pdb
 /Users/dzen/Documents/LOVAMAP/LOVAMAP_Core/lovamap-wrapper/WrapperApi/obj/Debug/net8.0/WrapperApi.genruntimeconfig.cache
 /Users/dzen/Documents/LOVAMAP/LOVAMAP_Core/lovamap-wrapper/WrapperApi/obj/Debug/net8.0/ref/WrapperApi.dll
+/Users/dzen/Documents/LOVAMAP/LOVAMAP_Core/lovamap-wrapper/WrapperApi/obj/Debug/net8.0/WrapperApi.sourcelink.json

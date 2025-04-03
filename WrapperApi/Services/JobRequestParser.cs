@@ -1,21 +1,23 @@
 
-namespace WrapperApi.Services;
-
-public static class JobRequestParser
+namespace WrapperApi.Services 
 {
-    public static string? ParseJobId(IFormCollection form)
+    public static class JobRequestParser
     {
-        if (form.TryGetValue("jobId", out var jobIdValue))
+        public static string? ParseJobId(IFormCollection form)
         {
-            var jobId = jobIdValue.ToString()?.Trim();
-            if (!string.IsNullOrWhiteSpace(jobId))
-                return jobId;
+            if (form.TryGetValue("jobId", out var jobIdValue))
+            {
+                var jobId = jobIdValue.ToString()?.Trim();
+                if (!string.IsNullOrWhiteSpace(jobId))
+                    return jobId;
+            }
+            return null;
         }
-        return null;
-    }
 
-    public static string ParseDxValue(IFormCollection form, string defaultValue = "4.0")
-    {
-        return form.TryGetValue("dx", out var dxValue) ? dxValue.ToString() : defaultValue;
+        public static string ParseDxValue(IFormCollection form, string defaultValue = "4.0")
+        {
+            return form.TryGetValue("dx", out var dxValue) ? dxValue.ToString() : defaultValue;
+        }
     }
 }
+
