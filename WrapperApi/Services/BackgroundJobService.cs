@@ -49,6 +49,12 @@ namespace WrapperApi.Services
                             return;
                         }
 
+                        // if ((job.Status != JobStatus.Pending) || (job.Status != JobStatus.Failed))
+                        // {
+                        //     Console.WriteLine($"[QUEUE] Job {job.Id} not ready for computation. Skipping.");
+                        //     return;
+                        // }
+
                         Console.WriteLine($"[QUEUE] Executing job {job.Id} from queue.");
 
                         var result = await _jobService.RunJobAsync(dbJob, dxValue);
@@ -60,6 +66,7 @@ namespace WrapperApi.Services
                             await db.SaveChangesAsync();
 
                             Console.WriteLine($"[RETRY] Re-enqueuing job {dbJob.Id} for retry {dbJob.RetryCount}");
+     
                             _jobQueue.Enqueue(dbJob, dxValue);
                         }
                         else if (!result.Success)

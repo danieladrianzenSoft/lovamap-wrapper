@@ -27,7 +27,7 @@ namespace WrapperApi.Services
 
                     foreach (var (jobId, (message, postedAt)) in _cache.GetAll())
                     {
-                        var job = await db.Jobs.FirstOrDefaultAsync(j => j.JobId == jobId, stoppingToken);
+                        var job = await db.Jobs.FirstOrDefaultAsync(j => j.Id.ToString() == jobId, stoppingToken);
                         if (job != null)
                         {
                             job.HeartbeatMessage = message;
@@ -45,6 +45,25 @@ namespace WrapperApi.Services
 
                 await Task.Delay(TimeSpan.FromMinutes(1), stoppingToken); ;
             }
+        }
+
+        public async Task FlushNowAsync()
+        {
+            using var scope = _services.CreateScope();
+            var db = scope.ServiceProvider.GetRequiredService<DataContext>();
+
+            foreach (var (jobId, (message, postedAt)) in _cache.GetAll())
+            {
+                var job = await db.Jobs.FirstOrDefaultAsync(j => j.Id.ToString() == jobId);
+                if (job != null)
+                {
+                    job.HeartbeatMessage = message;
+                    job.HeartbeatPostedAt = postedAt;
+                }
+            }
+
+            await db.SaveChangesAsync();
+            _logger.LogInformation($"[HEARTBEAT] Forced flush to DB at {DateTime.UtcNow}");
         }
     }
 }

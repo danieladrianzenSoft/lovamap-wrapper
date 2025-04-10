@@ -32,9 +32,11 @@ builder.Services.AddSingleton<JobService>(provider =>
     var scopeFactory = provider.GetRequiredService<IServiceScopeFactory>();
     var env = provider.GetRequiredService<IWebHostEnvironment>();
     var cache = provider.GetRequiredService<HeartbeatCache>();
-    return new JobService(scopeFactory, env, cache, inputDir, outputDir);
+    var heartbeatService = provider.GetRequiredService<HeartbeatService>();
+    return new JobService(scopeFactory, env, cache, heartbeatService, inputDir, outputDir);
 });
 
+builder.Services.AddScoped<HeartbeatService>();
 builder.Services.AddSingleton<IBackgroundJobQueue, BackgroundJobQueue>();
 builder.Services.AddSingleton<HeartbeatCache>();
 
@@ -151,9 +153,19 @@ app.MapDelete("/jobs", async (HttpRequest request, DataContext db) =>
         return Results.BadRequest("Missing or invalid 'start' query parameter (must be ISO date string).");
     }
 
-    var jobsToDelete = await db.Jobs
-        .Where(j => j.SubmittedAt < start && j.Status != JobStatus.Running)
-        .ToListAsync();
+    // Force flag deletes jobs regardless of status, not just non-running jobs
+    var force = query.ContainsKey("force") &&
+                bool.TryParse(query["force"], out var forceParsed) && forceParsed;
+
+    var jobQuery = db.Jobs.AsQueryable()
+        .Where(j => j.SubmittedAt <= start);
+
+    if (!force)
+    {
+        jobQuery = jobQuery.Where(j => j.Status != JobStatus.Running);
+    }
+
+    var jobsToDelete = await jobQuery.ToListAsync();
 
     int fileDeleteCount = 0;
     int outputDirDeleteCount = 0;
@@ -194,6 +206,7 @@ app.MapPost("/heartbeat", async (HttpRequest request, HeartbeatCache cache) =>
     }
     catch (Exception ex)
     {
+        Console.WriteLine($"[HEARTBEAT] Error - form could not be parsed: {ex}");
         return Results.BadRequest("Invalid or missing form data.");
     }
 
@@ -202,7 +215,7 @@ app.MapPost("/heartbeat", async (HttpRequest request, HeartbeatCache cache) =>
 
     if (string.IsNullOrEmpty(jobId))
     {
-        Console.WriteLine($"Missing jobId");
+        // Console.WriteLine($"Missing jobId");
         return Results.BadRequest("Missing jobId");
     }
 
