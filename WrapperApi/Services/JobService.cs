@@ -67,7 +67,7 @@ namespace WrapperApi.Services
 
 				var heartbeatEndpoint = $"{wrapperApiUrl}/heartbeat";
 				var heartbeatInterval = "5000"; // in ms, so 5s
-				string metadata = $"\\\"jobid={dbJob.Id}\\\"";
+				string metadata = $"jobid={dbJob.Id}";
 
 				var inputFilePath = Path.Combine(_inputDir, fileName);
 				const int maxRetries = 5;
