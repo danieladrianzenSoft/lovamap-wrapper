@@ -31,7 +31,7 @@ namespace WrapperApi.Services
 
             Console.WriteLine("[QUEUE] Background job service started.");
 
-            await foreach (var (job, dxValue) in _jobQueue.ReadAllAsync(stoppingToken))
+            await foreach (var (job, dxValue, uploadUrl, uploadToken) in _jobQueue.ReadAllAsync(stoppingToken))
             {
                 await _semaphore.WaitAsync(stoppingToken); // wait for an available slot
 
@@ -57,30 +57,45 @@ namespace WrapperApi.Services
 
                         Console.WriteLine($"[QUEUE] Executing job {job.Id} from queue.");
 
-                        var result = await _jobService.RunJobAsync(dbJob, dxValue);
-
-                        if (!result.Success && dbJob.RetryCount < dbJob.MaxRetries)
+                        var result = await _jobService.RunJobAsync(dbJob, dxValue, uploadUrl, uploadToken);
+                        
+                        // refresh the job entity from the DB so we don't work with stale tracked entity
+                        var freshJob = await db.Jobs.FindAsync(dbJob.Id);
+                        if (freshJob == null)
                         {
-                            dbJob.RetryCount++;
-                            dbJob.Status = JobStatus.Pending;
+                            Console.WriteLine($"[QUEUE] Job {dbJob.Id} not found after run. Skipping updates.");
+                            return;
+                        }
+
+                        if (!result.Success && result.ShouldRetry && freshJob.RetryCount < freshJob.MaxRetries)
+                        {
+                            freshJob.RetryCount++;
+
+                            if (freshJob.Status == JobStatus.Completed && freshJob.JobUploadSucceeded == false)
+                            {
+                                Console.WriteLine($"[RETRY-UPLOAD] Upload-only re-enqueue for job {freshJob.Id} (upload retry {freshJob.RetryCount})");
+                            }
+                            else
+                            {
+                                freshJob.Status = JobStatus.Pending;
+                                Console.WriteLine($"[RETRY-COMPUTE] Re-enqueuing job {freshJob.Id} for recompute (retry {freshJob.RetryCount})");
+                            }
                             await db.SaveChangesAsync();
 
-                            Console.WriteLine($"[RETRY] Re-enqueuing job {dbJob.Id} for retry {dbJob.RetryCount}");
-     
-                            _jobQueue.Enqueue(dbJob, dxValue);
+                            _jobQueue.Enqueue(freshJob, dxValue, uploadUrl, uploadToken);
                         }
                         else if (!result.Success)
                         {
-                            dbJob.Status = JobStatus.Failed;
-                            dbJob.CompletedAt = DateTime.UtcNow;
-                            dbJob.ErrorMessage = "Max retries reached";
+                            freshJob.Status = JobStatus.Failed;
+                            freshJob.CompletedAt = DateTime.UtcNow;
+                            freshJob.ErrorMessage = result.ErrorMessage ?? "Max retries reached";
                             await db.SaveChangesAsync();
 
-                            Console.WriteLine($"[FAIL] Job {dbJob.Id} failed after max retries.");
+                            Console.WriteLine($"[FAIL] Job {freshJob.Id} failed after max retries.");
                         }
                         else
                         {
-                            Console.WriteLine($"[SUCCESS] Job {dbJob.Id} completed.");
+                            Console.WriteLine($"[SUCCESS] Job {freshJob.Id} completed.");
                         }
                     }
                     catch (Exception ex)

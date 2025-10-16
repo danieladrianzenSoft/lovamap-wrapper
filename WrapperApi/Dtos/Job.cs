@@ -1,0 +1,1 @@
+public record JobRunResult(bool Success, bool ShouldRetry, string? ErrorMessage);
