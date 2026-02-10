@@ -16,16 +16,18 @@ namespace WrapperApi.Services
 		private readonly string _inputDir;
 		private readonly string _outputDir;
 		private readonly IHttpClientFactory _httpClientFactory;
+		private readonly IBackgroundJobQueue _jobQueue;
 		private HttpClient CreateClient() => _httpClientFactory.CreateClient();
 
 		public JobService(IServiceScopeFactory scopeFactory, IWebHostEnvironment env,
 			HeartbeatCache cache, HeartbeatService heartbeatService, IHttpClientFactory httpClientFactory,
-			string inputDir, string outputDir
+			IBackgroundJobQueue jobQueue, string inputDir, string outputDir
 		)
 		{
 			_heartbeatService = heartbeatService;
 			_scopeFactory = scopeFactory;
 			_httpClientFactory = httpClientFactory;
+			_jobQueue = jobQueue;
 			_env = env;
 			_cache = cache;
 			_inputDir = inputDir;
@@ -59,6 +61,12 @@ namespace WrapperApi.Services
 				// Early upload-only retry if computation already completed but upload didn't
 				if (dbJob.Status == JobStatus.Completed && dbJob.JobUploadSucceeded == false)
 				{
+					if (string.IsNullOrWhiteSpace(uploadUrl) || string.IsNullOrWhiteSpace(uploadToken))
+					{
+						Console.WriteLine($"[INFO] Job {dbJob.Id} completed and upload skipped (missing uploadUrl/uploadToken).");
+						return new JobRunResult(true, false, null);
+					}
+
 					Console.WriteLine($"[INFO] Job {dbJob.Id} already computed — performing upload-only retry.");
 					var outputFile = FindLatestOutputFile(hostOutputDir, baseName);
 
@@ -105,7 +113,12 @@ namespace WrapperApi.Services
 				// Compute
 				var computeResult = dbJob.JobType == JobType.MeshProcessing
 					? await RunMeshProcessingAsync(dbJob, hostInputDir, hostOutputDir)
-					: await RunComputationAsync(dbJob, dxValue, hostInputDir, hostOutputDir);
+					: await RunComputationAsync(
+						dbJob,
+						dxValue,
+						hostInputDir,
+						hostOutputDir,
+						writePoreMeshes: dbJob.GenerateMesh);
 				dbJob.CompletedAt = DateTime.UtcNow;
 				try
 				{
@@ -166,6 +179,16 @@ namespace WrapperApi.Services
 				dbJob.ResultPath = foundOutputFile;
 				await db.SaveChangesAsync();
 
+				await EnqueueMeshProcessingIfNeededAsync(db, dbJob);
+
+				if (string.IsNullOrWhiteSpace(uploadUrl) || string.IsNullOrWhiteSpace(uploadToken))
+				{
+					Console.WriteLine($"[INFO] Job {dbJob.Id} completed and upload skipped (missing uploadUrl/uploadToken).");
+					dbJob.JobUploadSucceeded = false;
+					await db.SaveChangesAsync();
+					return new JobRunResult(true, false, null);
+				}
+
 				return await TryUploadAsync(db, dbJob, uploadUrl, uploadToken, foundOutputFile);
 			}
 			catch (Exception ex)
@@ -181,81 +204,6 @@ namespace WrapperApi.Services
 				return new JobRunResult(false, true, ex.Message);
 			}
 		}
-
-		// private async Task<(bool Succeeded, string Stdout, string Stderr, string? ErrorMessage)>
-		// 	RunComputationAsync(Job dbJob, string dxValue, string hostInputDir, string hostOutputDir)
-		// {
-		// 	var containerName  = $"lovamap-job-{dbJob.Id}-{Guid.NewGuid()}";
-		// 	var platform       = Environment.GetEnvironmentVariable("PLATFORM")            ?? "linux/amd64";
-		// 	var wrapperApiUrl  = Environment.GetEnvironmentVariable("WRAPPER_API_URL")     ?? "http://localhost:8080";
-		// 	var heartbeatToken = Environment.GetEnvironmentVariable("HEARTBEAT_TOKEN")     ?? "sdf923lsd";
-		// 	var dockerNetwork  = Environment.GetEnvironmentVariable("DOCKER_NETWORK_NAME") ?? "lovamap_core_network";
-
-		// 	var imageName = Environment.GetEnvironmentVariable("LOVAMAP_IMAGE")
-		// 					?? "ghcr.io/seguralab/lovamap:v1.0.4"; // fallback, but env should be set
-		// 	var lovamapCmd = Environment.GetEnvironmentVariable("LOVAMAP_CMD")
-        //              ?? "/app/entrypoint.sh";
-
-		// 	var heartbeatEndpoint = $"{wrapperApiUrl.TrimEnd('/')}/heartbeat";
-		// 	var heartbeatInterval = "5000"; // ms
-		// 	string metadata = $"--heartbeat-metadata jobId={dbJob.Id}";
-
-		// 	Console.WriteLine($"heartbeatEndpoint: {heartbeatEndpoint}, heartbeatInterval: {heartbeatInterval}");
-		// 	Console.WriteLine($"Using image: {imageName}, network: {dockerNetwork}, platform: {platform}");
-
-		// 	var fileName = dbJob.FileName;
-
-		// 	var process = new Process
-		// 	{
-		// 		StartInfo = new ProcessStartInfo
-		// 		{
-		// 			FileName = "docker",
-		// 			Arguments =
-		// 				$"run --rm --platform {platform} --name {containerName} " +
-		// 				$"--network {dockerNetwork} " +
-		// 				$"-v {hostInputDir}:/app/input " +
-		// 				$"-v {hostOutputDir}:/app/output " +
-		// 				$"-e LOVAMAP_INPUT_DIR=/app/input " +
-		// 				$"-e LOVAMAP_OUTPUT_DIR=/app/output " +
-		// 				$"-e HEARTBEAT_TOKEN={heartbeatToken} " +
-		// 				$"-e LD_LIBRARY_PATH=/usr/local/lib:/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu " +
-		// 				$"{imageName} {lovamapCmd} {fileName} {dxValue} {heartbeatEndpoint} {heartbeatInterval} {metadata}",
-		// 			RedirectStandardOutput = true,
-		// 			RedirectStandardError  = true,
-		// 			UseShellExecute        = false,
-		// 			CreateNoWindow         = true
-		// 		}
-		// 	};
-
-		// 	try
-		// 	{
-		// 		_cache.MarkJobStarted(dbJob.Id.ToString());
-		// 		process.Start();
-		// 		var stdout = await process.StandardOutput.ReadToEndAsync();
-		// 		var stderr = await process.StandardError.ReadToEndAsync();
-		// 		process.WaitForExit();
-		// 		_cache.MarkJobCompleted(dbJob.Id.ToString());
-
-		// 		Console.WriteLine($"[DEBUG] Job {dbJob.Id} docker run exited with code {process.ExitCode}");
-		// 		Console.WriteLine($"[DEBUG] STDOUT: {stdout}");
-		// 		Console.WriteLine($"[DEBUG] STDERR: {stderr}");
-
-		// 		if (process.ExitCode != 0)
-		// 		{
-		// 			var err = string.IsNullOrWhiteSpace(stderr)
-		// 				? "Unknown error occurred during execution."
-		// 				: stderr;
-		// 			return (false, stdout, stderr, err);
-		// 		}
-
-		// 		return (true, stdout, stderr, null);
-		// 	}
-		// 	catch (Exception ex)
-		// 	{
-		// 		Console.WriteLine($"[ERROR] Exception when running docker for job {dbJob.Id}: {ex.Message}");
-		// 		return (false, string.Empty, string.Empty, ex.Message);
-		// 	}
-		// }
 
 		private async Task<(bool Succeeded, string Stdout, string Stderr, string? ErrorMessage)>
 			RunComputationAsync(
@@ -278,27 +226,31 @@ namespace WrapperApi.Services
 
 			var lovamapCmd = Environment.GetEnvironmentVariable("LOVAMAP_CMD")
 						?? "/app/entrypoint.sh";
+			var useEntrypoint = string.Equals(lovamapCmd, "/app/entrypoint.sh", StringComparison.OrdinalIgnoreCase);
 
 			var fileName = dbJob.FileName;
 
 			var heartbeatEndpoint = $"{wrapperApiUrl.TrimEnd('/')}/heartbeat";
 
 			// Build the entrypoint args
-			var entrypointArgs = new List<string>
+			var entrypointArgs = new List<string>();
+			if (!useEntrypoint)
+				entrypointArgs.Add(Quote(lovamapCmd));
+
+			entrypointArgs.AddRange(new[]
 			{
-				Quote(lovamapCmd),
 				"--input", Quote(fileName),
 				"--dx", Quote(dxValue),
 				"--heartbeat-endpoint", Quote(heartbeatEndpoint),
-				"--heartbeat-interval", Quote(heartbeatInterval.ToString()),
-				"-- --heartbeat-metadata", Quote($"jobId={dbJob.Id}")
-			};
+				"--heartbeat-interval", Quote(heartbeatInterval.ToString())
+			});
 
 			if (writePoreMeshes)
 				entrypointArgs.Add("--write-pore-meshes");
 
 			// Forward extra args to lovamap after "--"
-			var extras = (extraLovamapArgs ?? Enumerable.Empty<string>())
+			var extras = (new[] { "--heartbeat-metadata", $"jobId={dbJob.Id}" })
+				.Concat(extraLovamapArgs ?? Enumerable.Empty<string>())
 				.Where(a => !string.IsNullOrWhiteSpace(a))
 				.ToList();
 
@@ -315,6 +267,7 @@ namespace WrapperApi.Services
 				$"--network {Quote(dockerNetwork)} " +
 				$"-v {Quote(hostInputDir)}:/app/input " +
 				$"-v {Quote(hostOutputDir)}:/app/output " +
+				$"{(useEntrypoint ? $"--entrypoint {Quote(lovamapCmd)} " : "")}" +
 				$"-e LOVAMAP_INPUT_DIR=/app/input " +
 				$"-e LOVAMAP_OUTPUT_DIR=/app/output " +
 				$"-e HEARTBEAT_TOKEN={Quote(heartbeatToken)} " +
@@ -520,6 +473,52 @@ namespace WrapperApi.Services
 				return new JobRunResult(false, uploadShouldRetry, uploadErr);
 			}
 		}
+
+		private async Task EnqueueMeshProcessingIfNeededAsync(DataContext db, Job dbJob)
+		{
+			if (dbJob.JobType != JobType.Lovamap || !dbJob.GenerateMesh || dbJob.Status != JobStatus.Completed)
+				return;
+
+			var baseJobId = dbJob.JobId ?? dbJob.Id.ToString();
+			var meshJobPrefix = $"{baseJobId}-mesh";
+
+			var existingMesh = await db.Jobs.AnyAsync(j =>
+				j.JobType == JobType.MeshProcessing &&
+				j.JobId != null &&
+				j.JobId.StartsWith(meshJobPrefix) &&
+				(j.Status == JobStatus.Pending || j.Status == JobStatus.Running || j.Status == JobStatus.Completed));
+
+			if (existingMesh)
+			{
+				Console.WriteLine($"[QUEUE] Mesh processing already exists for job {dbJob.Id}; skipping auto-enqueue.");
+				return;
+			}
+
+			var meshJobId = meshJobPrefix;
+			if (await db.Jobs.AnyAsync(j => j.JobId == meshJobId))
+				meshJobId = $"{meshJobPrefix}-{Guid.NewGuid():N}";
+
+			var meshJob = new Job
+			{
+				JobId = meshJobId,
+				FileName = dbJob.FileName,
+				JobType = JobType.MeshProcessing,
+				Status = JobStatus.Pending,
+				SubmittedAt = DateTime.UtcNow,
+				InitiatorType = dbJob.InitiatorType,
+				UserId = dbJob.UserId,
+				ClientId = dbJob.ClientId,
+				DxValue = dbJob.DxValue,
+				GenerateMesh = false
+			};
+
+			db.Jobs.Add(meshJob);
+			await db.SaveChangesAsync();
+
+			var meshDxValue = meshJob.DxValue ?? "4.0";
+			_jobQueue.Enqueue(meshJob, meshDxValue, uploadUrl: null, uploadToken: null);
+			Console.WriteLine($"[QUEUE] Enqueued mesh processing job {meshJob.Id} for lovamap job {dbJob.Id}.");
+		}
 		
 		private string? FindLatestOutputFile(string outputRootDir, string baseName)
 		{
@@ -534,7 +533,9 @@ namespace WrapperApi.Services
 			// 1) Look for files matching output_YYYYMMDD_HHMMSS.ext
 			//    Use a pattern to only consider files with "output_" prefix.
 			var candidates = Directory.EnumerateFiles(jobOutputDir, "output_*.*", SearchOption.TopDirectoryOnly)
-				.Where(p => p.EndsWith(".json", StringComparison.OrdinalIgnoreCase))
+				.Where(p =>
+					p.EndsWith(".json", StringComparison.OrdinalIgnoreCase) ||
+					p.EndsWith(".proto", StringComparison.OrdinalIgnoreCase))
 				.ToList();
 
 			if (candidates.Count == 0)

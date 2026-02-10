@@ -112,8 +112,9 @@ builder.Services.AddSingleton<JobService>(provider =>
     var cache = provider.GetRequiredService<HeartbeatCache>();
     var heartbeatService = provider.GetRequiredService<HeartbeatService>();
     var httpFactory = provider.GetRequiredService<IHttpClientFactory>();
+    var jobQueue = provider.GetRequiredService<IBackgroundJobQueue>();
 
-    return new JobService(scopeFactory, env, cache, heartbeatService, httpFactory, inputDir, outputDir);
+    return new JobService(scopeFactory, env, cache, heartbeatService, httpFactory, jobQueue, inputDir, outputDir);
 });
 builder.Services.AddSingleton<IBackgroundJobQueue, BackgroundJobQueue>();
 builder.Services.AddScoped<IJwtGeneratorHelper, JwtGeneratorHelper>();
@@ -370,7 +371,8 @@ app.MapGet("/jobs", async (HttpRequest request, DataContext db) =>
             HeartbeatMessage = j.HeartbeatMessage,
             DxValue = j.DxValue,
             RetryCount = j.RetryCount,
-            MaxRetries = j.MaxRetries
+            MaxRetries = j.MaxRetries,
+            GenerateMesh = j.GenerateMesh
         })
         .ToListAsync();
 
@@ -403,6 +405,7 @@ app.MapPost("/jobs", async (
 
 	var jobId = JobRequestParser.ParseJobId(form);
     var dxValue = JobRequestParser.ParseDxValue(form);
+    var generateMesh = JobRequestParser.ParseGenerateMesh(form);
 
     if (string.IsNullOrEmpty(jobId)) return Results.BadRequest("jobId is required");
     if (await db.Jobs.AnyAsync(j => j.JobId == jobId))
@@ -438,6 +441,7 @@ app.MapPost("/jobs", async (
         SubmittedAt = DateTime.UtcNow,
         InitiatorType = initiatorType,
         DxValue = dxValue,
+        GenerateMesh = generateMesh
     };
 
     if (job.InitiatorType == InitiatorType.Client)
@@ -500,7 +504,8 @@ app.MapPost("/jobs", async (
         SubmittedAt = job.SubmittedAt,
         StartedAt = job.StartedAt,
         UserId = job.UserId,
-        ClientId = job.ClientId
+        ClientId = job.ClientId,
+        GenerateMesh = job.GenerateMesh
     };
 
     return Results.Created($"/jobs/by-jobid/{job.JobId ?? job.Id.ToString()}", jobDto);
@@ -536,7 +541,8 @@ app.MapPost("/jobs/{jobId}/mesh-processing", async (
         InitiatorType = sourceJob.InitiatorType,
         UserId = sourceJob.UserId,
         ClientId = sourceJob.ClientId,
-        DxValue = sourceJob.DxValue
+        DxValue = sourceJob.DxValue,
+        GenerateMesh = false
     };
 
     db.Jobs.Add(meshJob);
@@ -554,7 +560,8 @@ app.MapPost("/jobs/{jobId}/mesh-processing", async (
         SubmittedAt = meshJob.SubmittedAt,
         StartedAt = meshJob.StartedAt,
         UserId = meshJob.UserId,
-        ClientId = meshJob.ClientId
+        ClientId = meshJob.ClientId,
+        GenerateMesh = meshJob.GenerateMesh
     };
 
     return Results.Accepted($"/jobs/by-jobid/{meshJob.JobId}", meshJobDto);
@@ -655,6 +662,76 @@ app.MapGet("/jobs/{jobId}/raw-results", async (string jobId, DataContext db, ILo
     catch (Exception ex)
     {
         logger.LogError(ex, "Error reading result file for job {JobId} at {Path}", jobId, path);
+        return Results.StatusCode(500);
+    }
+}).AllowAnonymous();
+
+app.MapGet("/jobs/{jobId}/mesh", async (string jobId, DataContext db, ILogger<Program> logger) =>
+{
+    if (string.IsNullOrWhiteSpace(jobId))
+        return Results.BadRequest("jobId is required.");
+
+    var job = await db.Jobs
+        .AsNoTracking()
+        .FirstOrDefaultAsync(j => j.JobId == jobId);
+
+    if (job == null)
+    {
+        logger.LogWarning("Mesh requested for non-existent job {JobId}", jobId);
+        return Results.NotFound($"Job with JobId '{jobId}' not found.");
+    }
+
+    Job? meshJob = null;
+    if (job.JobType == JobType.MeshProcessing)
+    {
+        meshJob = job;
+    }
+    else if (job.JobType == JobType.Lovamap)
+    {
+        var baseJobId = job.JobId ?? job.Id.ToString();
+        var meshJobPrefix = $"{baseJobId}-mesh";
+
+        meshJob = await db.Jobs
+            .AsNoTracking()
+            .Where(j => j.JobType == JobType.MeshProcessing &&
+                        j.JobId != null &&
+                        j.JobId.StartsWith(meshJobPrefix))
+            .OrderByDescending(j => j.SubmittedAt)
+            .FirstOrDefaultAsync();
+    }
+
+    if (meshJob == null)
+        return Results.NotFound($"No mesh-processing job found for '{jobId}'.");
+
+    if (meshJob.Status == JobStatus.Pending)
+        return Results.NotFound($"Mesh generation pending for '{jobId}'.");
+
+    if (meshJob.Status == JobStatus.Running)
+        return Results.NotFound($"Mesh generation in process for '{jobId}'.");
+
+    if (meshJob.Status == JobStatus.Failed)
+        return Results.NotFound($"Mesh generation failed for '{jobId}'.");
+
+    var baseName = Path.GetFileNameWithoutExtension(meshJob.FileName);
+    var baseJobIdForOutput = meshJob.JobId ?? meshJob.Id.ToString();
+    var meshPath = Path.Combine(outputDir, baseName, $"{baseJobIdForOutput}_pores.glb");
+
+    if (!File.Exists(meshPath))
+    {
+        logger.LogWarning("Mesh file for job {JobId} not found at {Path}", jobId, meshPath);
+        return Results.NotFound($"Mesh file not found at '{meshPath}'.");
+    }
+
+    try
+    {
+        var stream = File.OpenRead(meshPath);
+        const string contentType = "model/gltf-binary";
+        var fileName = Path.GetFileName(meshPath);
+        return Results.File(stream, contentType, fileName, enableRangeProcessing: false);
+    }
+    catch (Exception ex)
+    {
+        logger.LogError(ex, "Error reading mesh file for job {JobId} at {Path}", jobId, meshPath);
         return Results.StatusCode(500);
     }
 }).AllowAnonymous();

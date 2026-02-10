@@ -26,6 +26,7 @@ public class Job
     public string? DxValue { get; set; } // Store the dx value if it varies per job
     public int RetryCount { get; set; } = 0;
     public int MaxRetries { get; set; } = 3;
+    public bool GenerateMesh { get; set; } = true;
 
 }
 

@@ -1,5 +1,6 @@
 using WrapperApi.Data;
 using WrapperApi.Models;
+using Microsoft.EntityFrameworkCore;
 
 namespace WrapperApi.Services
 {
@@ -86,17 +87,22 @@ namespace WrapperApi.Services
                         }
                         else if (!result.Success)
                         {
-                            freshJob.Status = JobStatus.Failed;
-                            freshJob.CompletedAt = DateTime.UtcNow;
-                            freshJob.ErrorMessage = result.ErrorMessage ?? "Max retries reached";
-                            await db.SaveChangesAsync();
+                            if (freshJob.Status == JobStatus.Completed && freshJob.JobUploadSucceeded == false)
+                            {
+                                Console.WriteLine($"[WARN] Job {freshJob.Id} completed but upload failed; leaving status Completed.");
+                            }
+                            else
+                            {
+                                freshJob.Status = JobStatus.Failed;
+                                freshJob.CompletedAt = DateTime.UtcNow;
+                                freshJob.ErrorMessage = result.ErrorMessage ?? "Max retries reached";
+                                await db.SaveChangesAsync();
 
-                            Console.WriteLine($"[FAIL] Job {freshJob.Id} failed after max retries.");
+                                Console.WriteLine($"[FAIL] Job {freshJob.Id} failed after max retries.");
+                            }
                         }
-                        else
-                        {
+                        if (result.Success)
                             Console.WriteLine($"[SUCCESS] Job {freshJob.Id} completed.");
-                        }
                     }
                     catch (Exception ex)
                     {
@@ -111,4 +117,3 @@ namespace WrapperApi.Services
         }
     }
 }
-
