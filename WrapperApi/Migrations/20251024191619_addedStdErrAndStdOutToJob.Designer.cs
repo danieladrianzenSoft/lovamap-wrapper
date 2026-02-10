@@ -2,6 +2,7 @@
 using System;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 using WrapperApi.Data;
@@ -11,9 +12,11 @@ using WrapperApi.Data;
 namespace WrapperApi.Migrations
 {
     [DbContext(typeof(DataContext))]
-    partial class DataContextModelSnapshot : ModelSnapshot
+    [Migration("20251024191619_addedStdErrAndStdOutToJob")]
+    partial class addedStdErrAndStdOutToJob
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder
@@ -329,9 +332,6 @@ namespace WrapperApi.Migrations
 
                     b.Property<string>("JobId")
                         .HasColumnType("text");
-
-                    b.Property<int>("JobType")
-                        .HasColumnType("integer");
 
                     b.Property<bool>("JobUploadSucceeded")
                         .HasColumnType("boolean");

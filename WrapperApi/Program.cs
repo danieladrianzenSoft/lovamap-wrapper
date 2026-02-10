@@ -8,6 +8,7 @@ using WrapperApi.Data;
 using WrapperApi.Models;
 using WrapperApi.Services;
 using WrapperApi.Helpers;
+using System.Globalization;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -297,14 +298,37 @@ app.MapPost("/users",
 // Get all jobs
 app.MapGet("/jobs", async (HttpRequest request, DataContext db) =>
 {
-    var query = request.Query;
+    // Parse query parameters (simple handling for date-only like "2024-03-01")
+    DateTime? ParseAsUtcDateOrDateTime(string key, bool endOfDayIfDateOnly = false)
+    {
+        if (!request.Query.ContainsKey(key)) return null;
+        var s = request.Query[key].ToString().Trim();
+        if (!DateTime.TryParse(s, CultureInfo.InvariantCulture, DateTimeStyles.None, out var parsed)) return null;
+
+        // If client sent a date-only string (no 'T' time separator), treat it as date-only.
+        var isDateOnly = !s.Contains('T') && s.Length <= 10;
+
+        if (isDateOnly)
+        {
+            var dt = parsed.Date;
+            if (endOfDayIfDateOnly)
+                dt = dt.AddDays(1).AddTicks(-1); // end of day (UTC)
+            return DateTime.SpecifyKind(dt, DateTimeKind.Utc);
+        }
+
+        // If the string included time / offset, normalize to UTC.
+        if (DateTimeOffset.TryParse(s, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var dto))
+            return dto.UtcDateTime;
+
+        return DateTime.SpecifyKind(parsed, DateTimeKind.Utc);
+    }
+
+    // Usage
+    DateTime? start = ParseAsUtcDateOrDateTime("start", endOfDayIfDateOnly: false);
+    DateTime? end   = ParseAsUtcDateOrDateTime("end",   endOfDayIfDateOnly: true);
+
+    // Determine final start and end values (UTC)
     var now = DateTime.UtcNow;
-
-    // Parse query parameters
-    DateTime? start = query.ContainsKey("start") && DateTime.TryParse(query["start"], out var parsedStart) ? parsedStart : null;
-    DateTime? end = query.ContainsKey("end") && DateTime.TryParse(query["end"], out var parsedEnd) ? parsedEnd : null;
-
-    // Determine final start and end values
     if (start == null && end == null)
     {
         start = now.AddDays(-7);
@@ -319,9 +343,35 @@ app.MapGet("/jobs", async (HttpRequest request, DataContext db) =>
         start = end.Value.AddDays(-7);
     }
 
+    // Make non-null local values for EF comparisons
+    var startUtc = DateTime.SpecifyKind(start!.Value, DateTimeKind.Utc);
+    var endUtc   = DateTime.SpecifyKind(end!.Value,   DateTimeKind.Utc);
+
     var jobs = await db.Jobs
-        .Where(j => j.SubmittedAt >= start && j.SubmittedAt <= end)
+        .Where(j => j.SubmittedAt >= startUtc && j.SubmittedAt <= endUtc)
         .OrderByDescending(j => j.SubmittedAt)
+        .Select(j => new JobDto
+        {
+            Id = j.Id,
+            JobId = j.JobId,
+            FileName = j.FileName,
+            JobType = j.JobType,
+            Status = j.Status,
+            SubmittedAt = j.SubmittedAt,
+            StartedAt = j.StartedAt,
+            CompletedAt = j.CompletedAt,
+            UserId = j.UserId,
+            ClientId = j.ClientId,
+            Priority = j.Priority,
+            StdOut = j.StdOut,
+            StdErr = j.StdErr,
+            JobUploadSucceeded = j.JobUploadSucceeded,
+            HeartbeatPostedAt = j.HeartbeatPostedAt,
+            HeartbeatMessage = j.HeartbeatMessage,
+            DxValue = j.DxValue,
+            RetryCount = j.RetryCount,
+            MaxRetries = j.MaxRetries
+        })
         .ToListAsync();
 
     return Results.Ok(jobs);
@@ -383,6 +433,7 @@ app.MapPost("/jobs", async (
     {
 		JobId = jobId,
         FileName = fileName,
+        JobType = JobType.Lovamap,
         Status = JobStatus.Pending,
         SubmittedAt = DateTime.UtcNow,
         InitiatorType = initiatorType,
@@ -394,6 +445,13 @@ app.MapPost("/jobs", async (
         if (!int.TryParse(idClaim, out var clientIdParsed))
             return Results.Forbid();
 
+        var client = await db.Clients.FindAsync(clientIdParsed);
+        if (client == null)
+        {
+            Console.WriteLine($"[WARN] Auth token claimed client id='{idClaim}' but no client exists.");
+            return Results.Forbid();
+        }
+
         job.ClientId = clientIdParsed;
         job.UserId = null;
     }
@@ -401,8 +459,15 @@ app.MapPost("/jobs", async (
     {
         if (string.IsNullOrEmpty(idClaim))
             return Results.Forbid();
+
+        var dbUser = await db.Users.FindAsync(idClaim);
+        if (dbUser == null)
+        {
+            Console.WriteLine($"[WARN] Auth token claimed user id='{idClaim}' but no user exists.");
+            return Results.Forbid();
+        }
+        job.UserId = dbUser.Id;
         job.ClientId = null;
-        job.UserId = idClaim;
     }
     else
     {
@@ -410,15 +475,89 @@ app.MapPost("/jobs", async (
     }
 
     db.Jobs.Add(job);
-    await db.SaveChangesAsync();
+    try
+    {
+        await db.SaveChangesAsync();
+    }
+    catch (DbUpdateException dbEx)
+    {
+        Console.WriteLine($"[ERROR] DbUpdateException saving job: {dbEx}");
+        return Results.Problem("Failed to save job. Please contact support.", statusCode: 400);
+    }
     
     var uploadUrl = form["uploadUrl"].ToString();
     var uploadToken = form["uploadToken"].ToString();
 
-	// await jobService.RunJobAsync(job, dxValue);
+    // await jobService.RunJobAsync(job, dxValue);
     jobQueue.Enqueue(job, dxValue, uploadUrl, uploadToken);
+    
+    var jobDto = new JobDto {
+        Id = job.Id,
+        JobId = job.JobId,
+        FileName = job.FileName,
+        JobType = job.JobType,
+        Status = job.Status,
+        SubmittedAt = job.SubmittedAt,
+        StartedAt = job.StartedAt,
+        UserId = job.UserId,
+        ClientId = job.ClientId
+    };
 
-    return Results.Created($"/jobs/by-jobid/{job.JobId ?? job.Id.ToString()}", job);
+    return Results.Created($"/jobs/by-jobid/{job.JobId ?? job.Id.ToString()}", jobDto);
+}).AllowClientOrUser();
+
+// Trigger mesh-processing (unite_meshes) for an existing job by JobId
+app.MapPost("/jobs/{jobId}/mesh-processing", async (
+    string jobId, DataContext db, ClaimsPrincipal user,
+    IBackgroundJobQueue jobQueue) =>
+{
+    var sourceJob = await db.Jobs.FirstOrDefaultAsync(j => j.JobId == jobId);
+    if (sourceJob == null)
+        return Results.NotFound($"No job found with JobId '{jobId}'.");
+
+    if (sourceJob.JobType != JobType.Lovamap)
+        return Results.BadRequest("Mesh processing can only be triggered from a Lovamap job.");
+
+    if (sourceJob.Status != JobStatus.Completed)
+        return Results.BadRequest("Source job must be Completed before mesh processing can run.");
+
+    var baseJobId = sourceJob.JobId ?? sourceJob.Id.ToString();
+    var meshJobId = $"{baseJobId}-mesh";
+    if (await db.Jobs.AnyAsync(j => j.JobId == meshJobId))
+        meshJobId = $"{baseJobId}-mesh-{Guid.NewGuid():N}";
+
+    var meshJob = new Job
+    {
+        JobId = meshJobId,
+        FileName = sourceJob.FileName,
+        JobType = JobType.MeshProcessing,
+        Status = JobStatus.Pending,
+        SubmittedAt = DateTime.UtcNow,
+        InitiatorType = sourceJob.InitiatorType,
+        UserId = sourceJob.UserId,
+        ClientId = sourceJob.ClientId,
+        DxValue = sourceJob.DxValue
+    };
+
+    db.Jobs.Add(meshJob);
+    await db.SaveChangesAsync();
+
+    var dxValue = meshJob.DxValue ?? "4.0";
+    jobQueue.Enqueue(meshJob, dxValue, uploadUrl: null, uploadToken: null);
+
+    var meshJobDto = new JobDto {
+        Id = meshJob.Id,
+        JobId = meshJob.JobId,
+        FileName = meshJob.FileName,
+        JobType = meshJob.JobType,
+        Status = meshJob.Status,
+        SubmittedAt = meshJob.SubmittedAt,
+        StartedAt = meshJob.StartedAt,
+        UserId = meshJob.UserId,
+        ClientId = meshJob.ClientId
+    };
+
+    return Results.Accepted($"/jobs/by-jobid/{meshJob.JobId}", meshJobDto);
 }).AllowClientOrUser();
 
 app.MapDelete("/jobs", async (HttpRequest request, DataContext db) =>
@@ -467,6 +606,58 @@ app.MapDelete("/jobs", async (HttpRequest request, DataContext db) =>
         Cutoff = start
     });
 }).AllowUserRoles("Admin");
+
+app.MapGet("/jobs/{jobId}/raw-results", async (string jobId, DataContext db, ILogger<Program> logger) =>
+{
+	if (string.IsNullOrWhiteSpace(jobId))
+    {
+        return Results.BadRequest("jobId is required.");
+    }
+
+    // Look up job by JobId (string GUID), not int Id
+    var job = await db.Jobs
+        .AsNoTracking()
+        .FirstOrDefaultAsync(j => j.JobId == jobId);
+
+    if (job == null)
+    {
+        logger.LogWarning("Raw result requested for non-existent job {JobId}", jobId);
+        return Results.NotFound($"Job with JobId '{jobId}' not found.");
+    }
+
+    if (string.IsNullOrWhiteSpace(job.ResultPath))
+    {
+        logger.LogWarning("Job {JobId} has no ResultPath stored.", jobId);
+        return Results.NotFound($"Job '{jobId}' does not have a result path stored.");
+    }
+
+    var path = job.ResultPath;
+
+    if (!File.Exists(path))
+    {
+        logger.LogWarning("Result file for job {JobId} not found at {Path}", jobId, path);
+        return Results.NotFound($"Result file not found at '{path}'.");
+    }
+
+    try
+    {
+        // Stream the file (raw bytes); GW will interpret as protobuf
+        var stream = File.OpenRead(path);
+
+        // Use a generic content type; you can change this to application/x-protobuf if you like
+        const string contentType = "application/octet-stream";
+
+        // Optional: send a nice filename, but not required since GW only cares about bytes
+        var fileName = Path.GetFileName(path);
+
+        return Results.File(stream, contentType, fileName, enableRangeProcessing: false);
+    }
+    catch (Exception ex)
+    {
+        logger.LogError(ex, "Error reading result file for job {JobId} at {Path}", jobId, path);
+        return Results.StatusCode(500);
+    }
+}).AllowAnonymous();
 
 app.MapPost("/heartbeat", async (HttpRequest request, HeartbeatCache cache) =>
 {

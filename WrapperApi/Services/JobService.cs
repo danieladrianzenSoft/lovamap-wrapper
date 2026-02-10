@@ -70,6 +70,8 @@ namespace WrapperApi.Services
 						return new JobRunResult(false, true, msg);
 					}
 
+					dbJob.ResultPath = outputFile;
+					await db.SaveChangesAsync();
 					return await TryUploadAsync(db, dbJob, uploadUrl, uploadToken, outputFile);
 				}
 
@@ -101,7 +103,9 @@ namespace WrapperApi.Services
 				}
 
 				// Compute
-        		var computeResult = await RunComputationAsync(dbJob, dxValue, hostInputDir, hostOutputDir);
+				var computeResult = dbJob.JobType == JobType.MeshProcessing
+					? await RunMeshProcessingAsync(dbJob, hostInputDir, hostOutputDir)
+					: await RunComputationAsync(dbJob, dxValue, hostInputDir, hostOutputDir);
 				dbJob.CompletedAt = DateTime.UtcNow;
 				try
 				{
@@ -117,11 +121,29 @@ namespace WrapperApi.Services
 					// Computation error, retry
 					dbJob.Status = JobStatus.Failed;
 					dbJob.ErrorMessage = computeResult.ErrorMessage ?? "[COMPUTE] Unknown error during computation";
+					dbJob.StdErr = computeResult.Stderr;
+					dbJob.StdOut = computeResult.Stdout;
 					await db.SaveChangesAsync();
 					return new JobRunResult(false, true, dbJob.ErrorMessage);
 				}
 
-				// Get output file
+				if (dbJob.JobType == JobType.MeshProcessing)
+				{
+					dbJob.StdErr = computeResult.Stderr;
+					dbJob.StdOut = computeResult.Stdout;
+					dbJob.Status = JobStatus.Completed;
+					dbJob.CompletedAt = DateTime.UtcNow;
+
+					// best-effort result path (entire job output directory)
+					var meshOutputDir = Path.Combine(_outputDir, baseName);
+					dbJob.ResultPath = Directory.Exists(meshOutputDir) ? meshOutputDir : null;
+					dbJob.JobUploadSucceeded = true;
+					await db.SaveChangesAsync();
+
+					return new JobRunResult(true, false, null);
+				}
+
+				// Get output file (Lovamap)
 				var foundOutputFile = FindLatestOutputFile(_outputDir, baseName);
 				if (string.IsNullOrEmpty(foundOutputFile) || !File.Exists(foundOutputFile))
 				{
@@ -131,12 +153,17 @@ namespace WrapperApi.Services
 					Console.WriteLine($"{msg}");
 					dbJob.Status = JobStatus.Failed;
 					dbJob.ErrorMessage = msg;
+					dbJob.StdErr = computeResult.Stderr;
+					dbJob.StdOut = computeResult.Stdout;
 					await db.SaveChangesAsync();
 					return new JobRunResult(false, true, msg);
 				}
 
+				dbJob.StdErr = computeResult.Stderr;
+				dbJob.StdOut = computeResult.Stdout;
 				dbJob.Status = JobStatus.Completed;
 				dbJob.CompletedAt = DateTime.UtcNow;
+				dbJob.ResultPath = foundOutputFile;
 				await db.SaveChangesAsync();
 
 				return await TryUploadAsync(db, dbJob, uploadUrl, uploadToken, foundOutputFile);
@@ -155,36 +182,277 @@ namespace WrapperApi.Services
 			}
 		}
 
-		// Runs docker and returns success, stdout/stderr, message
-		private async Task<(bool Succeeded, string Stdout, string Stderr, string? ErrorMessage)> RunComputationAsync(Job dbJob, string dxValue, string hostInputDir, string hostOutputDir)
-		{
-			var containerName = $"lovamap-job-{dbJob.Id}-{Guid.NewGuid()}";
-			var targetArch = Environment.GetEnvironmentVariable("TARGETARCH") ?? "amd64";
-			var platform = Environment.GetEnvironmentVariable("PLATFORM") ?? "linux/amd64";
-			var imageName = $"lovamap:{targetArch}";
-			var wrapperApiUrl = Environment.GetEnvironmentVariable("WRAPPER_API_URL") ?? "http://localhost:8080";
-			var heartbeatToken = Environment.GetEnvironmentVariable("HEARTBEAT_TOKEN") ?? "sdf923lsd";
-			var dockerNetwork = Environment.GetEnvironmentVariable("DOCKER_NETWORK_NAME") ?? "lovamap_core_network";
+		// private async Task<(bool Succeeded, string Stdout, string Stderr, string? ErrorMessage)>
+		// 	RunComputationAsync(Job dbJob, string dxValue, string hostInputDir, string hostOutputDir)
+		// {
+		// 	var containerName  = $"lovamap-job-{dbJob.Id}-{Guid.NewGuid()}";
+		// 	var platform       = Environment.GetEnvironmentVariable("PLATFORM")            ?? "linux/amd64";
+		// 	var wrapperApiUrl  = Environment.GetEnvironmentVariable("WRAPPER_API_URL")     ?? "http://localhost:8080";
+		// 	var heartbeatToken = Environment.GetEnvironmentVariable("HEARTBEAT_TOKEN")     ?? "sdf923lsd";
+		// 	var dockerNetwork  = Environment.GetEnvironmentVariable("DOCKER_NETWORK_NAME") ?? "lovamap_core_network";
 
-			var heartbeatEndpoint = $"{wrapperApiUrl}/heartbeat";
-			var heartbeatInterval = "5000"; // ms
-			string metadata = $"--heartbeat-metadata jobId={dbJob.Id}";
+		// 	var imageName = Environment.GetEnvironmentVariable("LOVAMAP_IMAGE")
+		// 					?? "ghcr.io/seguralab/lovamap:v1.0.4"; // fallback, but env should be set
+		// 	var lovamapCmd = Environment.GetEnvironmentVariable("LOVAMAP_CMD")
+        //              ?? "/app/entrypoint.sh";
+
+		// 	var heartbeatEndpoint = $"{wrapperApiUrl.TrimEnd('/')}/heartbeat";
+		// 	var heartbeatInterval = "5000"; // ms
+		// 	string metadata = $"--heartbeat-metadata jobId={dbJob.Id}";
+
+		// 	Console.WriteLine($"heartbeatEndpoint: {heartbeatEndpoint}, heartbeatInterval: {heartbeatInterval}");
+		// 	Console.WriteLine($"Using image: {imageName}, network: {dockerNetwork}, platform: {platform}");
+
+		// 	var fileName = dbJob.FileName;
+
+		// 	var process = new Process
+		// 	{
+		// 		StartInfo = new ProcessStartInfo
+		// 		{
+		// 			FileName = "docker",
+		// 			Arguments =
+		// 				$"run --rm --platform {platform} --name {containerName} " +
+		// 				$"--network {dockerNetwork} " +
+		// 				$"-v {hostInputDir}:/app/input " +
+		// 				$"-v {hostOutputDir}:/app/output " +
+		// 				$"-e LOVAMAP_INPUT_DIR=/app/input " +
+		// 				$"-e LOVAMAP_OUTPUT_DIR=/app/output " +
+		// 				$"-e HEARTBEAT_TOKEN={heartbeatToken} " +
+		// 				$"-e LD_LIBRARY_PATH=/usr/local/lib:/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu " +
+		// 				$"{imageName} {lovamapCmd} {fileName} {dxValue} {heartbeatEndpoint} {heartbeatInterval} {metadata}",
+		// 			RedirectStandardOutput = true,
+		// 			RedirectStandardError  = true,
+		// 			UseShellExecute        = false,
+		// 			CreateNoWindow         = true
+		// 		}
+		// 	};
+
+		// 	try
+		// 	{
+		// 		_cache.MarkJobStarted(dbJob.Id.ToString());
+		// 		process.Start();
+		// 		var stdout = await process.StandardOutput.ReadToEndAsync();
+		// 		var stderr = await process.StandardError.ReadToEndAsync();
+		// 		process.WaitForExit();
+		// 		_cache.MarkJobCompleted(dbJob.Id.ToString());
+
+		// 		Console.WriteLine($"[DEBUG] Job {dbJob.Id} docker run exited with code {process.ExitCode}");
+		// 		Console.WriteLine($"[DEBUG] STDOUT: {stdout}");
+		// 		Console.WriteLine($"[DEBUG] STDERR: {stderr}");
+
+		// 		if (process.ExitCode != 0)
+		// 		{
+		// 			var err = string.IsNullOrWhiteSpace(stderr)
+		// 				? "Unknown error occurred during execution."
+		// 				: stderr;
+		// 			return (false, stdout, stderr, err);
+		// 		}
+
+		// 		return (true, stdout, stderr, null);
+		// 	}
+		// 	catch (Exception ex)
+		// 	{
+		// 		Console.WriteLine($"[ERROR] Exception when running docker for job {dbJob.Id}: {ex.Message}");
+		// 		return (false, string.Empty, string.Empty, ex.Message);
+		// 	}
+		// }
+
+		private async Task<(bool Succeeded, string Stdout, string Stderr, string? ErrorMessage)>
+			RunComputationAsync(
+				Job dbJob,
+				string dxValue,
+				string hostInputDir,
+				string hostOutputDir,
+				bool writePoreMeshes = true,
+				IEnumerable<string>? extraLovamapArgs = null,
+				int heartbeatInterval = 5000) // milliseconds
+		{
+			var containerName  = $"lovamap-job-{dbJob.Id}-{Guid.NewGuid()}";
+			var platform       = Environment.GetEnvironmentVariable("PLATFORM")            ?? "linux/amd64";
+			var wrapperApiUrl  = Environment.GetEnvironmentVariable("WRAPPER_API_URL")     ?? "http://localhost:8080";
+			var heartbeatToken = Environment.GetEnvironmentVariable("HEARTBEAT_TOKEN")     ?? "sdf923lsd";
+			var dockerNetwork  = Environment.GetEnvironmentVariable("DOCKER_NETWORK_NAME") ?? "lovamap_core_network";
+
+			var imageName = Environment.GetEnvironmentVariable("LOVAMAP_IMAGE")
+						?? "ghcr.io/seguralab/lovamap:v1.0.4";
+
+			var lovamapCmd = Environment.GetEnvironmentVariable("LOVAMAP_CMD")
+						?? "/app/entrypoint.sh";
 
 			var fileName = dbJob.FileName;
+
+			var heartbeatEndpoint = $"{wrapperApiUrl.TrimEnd('/')}/heartbeat";
+
+			// Build the entrypoint args
+			var entrypointArgs = new List<string>
+			{
+				Quote(lovamapCmd),
+				"--input", Quote(fileName),
+				"--dx", Quote(dxValue),
+				"--heartbeat-endpoint", Quote(heartbeatEndpoint),
+				"--heartbeat-interval", Quote(heartbeatInterval.ToString()),
+				"-- --heartbeat-metadata", Quote($"jobId={dbJob.Id}")
+			};
+
+			if (writePoreMeshes)
+				entrypointArgs.Add("--write-pore-meshes");
+
+			// Forward extra args to lovamap after "--"
+			var extras = (extraLovamapArgs ?? Enumerable.Empty<string>())
+				.Where(a => !string.IsNullOrWhiteSpace(a))
+				.ToList();
+
+			if (extras.Count > 0)
+			{
+				entrypointArgs.Add("--");
+				entrypointArgs.AddRange(extras.Select(Quote));
+			}
+
+			var dockerArgs =
+				"run --rm " +
+				$"--platform {Quote(platform)} " +
+				$"--name {Quote(containerName)} " +
+				$"--network {Quote(dockerNetwork)} " +
+				$"-v {Quote(hostInputDir)}:/app/input " +
+				$"-v {Quote(hostOutputDir)}:/app/output " +
+				$"-e LOVAMAP_INPUT_DIR=/app/input " +
+				$"-e LOVAMAP_OUTPUT_DIR=/app/output " +
+				$"-e HEARTBEAT_TOKEN={Quote(heartbeatToken)} " +
+				$"-e LD_LIBRARY_PATH=/usr/local/lib:/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu " +
+				$"{Quote(imageName)} " +
+				string.Join(" ", entrypointArgs);
+
+			Console.WriteLine($"Using image: {imageName}, network: {dockerNetwork}, platform: {platform}");
+			Console.WriteLine($"docker {dockerArgs}");
 
 			var process = new Process
 			{
 				StartInfo = new ProcessStartInfo
 				{
 					FileName = "docker",
-					Arguments = $"run --rm --platform {platform} --name {containerName} " +
-								$"--network {dockerNetwork} " +
-								$"-v {hostInputDir}:/app/input " +
-								$"-v {hostOutputDir}:/app/output " +
-								$"-e LOVAMAP_INPUT_DIR=/app/input " +
-								$"-e LOVAMAP_OUTPUT_DIR=/app/output " +
-								$"-e HEARTBEAT_TOKEN={heartbeatToken} " +
-								$"{imageName} {fileName} {dxValue} {heartbeatEndpoint} {heartbeatInterval} {metadata}",
+					Arguments = dockerArgs,
+					RedirectStandardOutput = true,
+					RedirectStandardError  = true,
+					UseShellExecute        = false,
+					CreateNoWindow         = true
+				}
+			};
+
+			try
+			{
+				_cache.MarkJobStarted(dbJob.Id.ToString());
+
+				process.Start();
+
+				var stdoutTask = process.StandardOutput.ReadToEndAsync();
+				var stderrTask = process.StandardError.ReadToEndAsync();
+
+				await process.WaitForExitAsync();
+
+				var stdout = await stdoutTask;
+				var stderr = await stderrTask;
+
+				_cache.MarkJobCompleted(dbJob.Id.ToString());
+
+				Console.WriteLine($"[DEBUG] Job {dbJob.Id} docker run exited with code {process.ExitCode}");
+				Console.WriteLine($"[DEBUG] STDOUT: {stdout}");
+				Console.WriteLine($"[DEBUG] STDERR: {stderr}");
+
+				if (process.ExitCode != 0)
+				{
+					var err = string.IsNullOrWhiteSpace(stderr)
+						? $"Docker run failed with exit code {process.ExitCode}."
+						: stderr;
+
+					return (false, stdout, stderr, err);
+				}
+
+				return (true, stdout, stderr, null);
+			}
+			catch (Exception ex)
+			{
+				Console.WriteLine($"[ERROR] Exception when running docker for job {dbJob.Id}: {ex}");
+				return (false, string.Empty, string.Empty, ex.Message);
+			}
+		}
+
+		private async Task<(bool Succeeded, string Stdout, string Stderr, string? ErrorMessage)>
+			RunMeshProcessingAsync(
+				Job dbJob,
+				string hostInputDir,
+				string hostOutputDir)
+		{
+			var containerName = $"mesh-processing-job-{dbJob.Id}-{Guid.NewGuid()}";
+			var platform = Environment.GetEnvironmentVariable("PLATFORM") ?? "linux/amd64";
+			var dockerNetwork = Environment.GetEnvironmentVariable("DOCKER_NETWORK_NAME") ?? "lovamap_core_network";
+
+			var imageName = Environment.GetEnvironmentVariable("SEGMENTATION_WORKFLOWS_IMAGE");
+			if (string.IsNullOrWhiteSpace(imageName))
+				return (false, string.Empty, string.Empty, "SEGMENTATION_WORKFLOWS_IMAGE is not set.");
+
+			var workflowName = Environment.GetEnvironmentVariable("SEG_WORKFLOW_NAME") ?? "unite_meshes";
+			var workflowEntrypoint = Environment.GetEnvironmentVariable("SEG_WORKFLOW_ENTRYPOINT");
+			var workflowScript = Environment.GetEnvironmentVariable("SEG_WORKFLOW_SCRIPT");
+			var workflowMode = Environment.GetEnvironmentVariable("SEG_WORKFLOW_MODE");
+
+			var baseName = Path.GetFileNameWithoutExtension(dbJob.FileName);
+			var baseJobId = string.IsNullOrWhiteSpace(dbJob.JobId) ? dbJob.Id.ToString() : dbJob.JobId;
+			var hostConfigPath = Path.Combine(hostOutputDir, baseName, "unite_meshes.json");
+			var containerConfigPath = $"/app/output/{baseName}/unite_meshes.json";
+			var hasConfig = File.Exists(hostConfigPath);
+
+			var entrypointArgs = new List<string>();
+
+			// If an explicit entrypoint is provided, use it and optionally pass a script path.
+			// Otherwise assume the image entrypoint already runs run.py, and only pass args.
+			if (!string.IsNullOrWhiteSpace(workflowEntrypoint))
+			{
+				if (!string.IsNullOrWhiteSpace(workflowScript))
+					entrypointArgs.Add(Quote(workflowScript));
+			}
+
+			entrypointArgs.AddRange(new[] { "--workflow", Quote(workflowName) });
+
+			if (hasConfig)
+			{
+				entrypointArgs.Add("--config");
+				entrypointArgs.Add(Quote(containerConfigPath));
+			}
+			else
+			{
+				var meshOutputDir = $"/app/output/{baseName}";
+				var meshInputDir = $"{meshOutputDir}/pores";
+				var outputName = $"{baseJobId}_pores.glb";
+				entrypointArgs.AddRange(new[]
+				{
+					"--set",
+					$"input_dir={Quote(meshInputDir)}",
+					$"output_dir={Quote(meshOutputDir)}",
+					$"output_name={Quote(outputName)}"
+				});
+			}
+
+			var dockerArgs =
+				"run --rm " +
+				$"--platform {Quote(platform)} " +
+				$"--name {Quote(containerName)} " +
+				$"--network {Quote(dockerNetwork)} " +
+				$"-v {Quote(hostInputDir)}:/app/input " +
+				$"-v {Quote(hostOutputDir)}:/app/output " +
+				$"{(string.IsNullOrWhiteSpace(workflowEntrypoint) ? "" : $"--entrypoint {Quote(workflowEntrypoint)} ")}" +
+				$"{(string.IsNullOrWhiteSpace(workflowMode) ? "" : $"-e SEG_WORKFLOW_MODE={Quote(workflowMode)} ")}" +
+				$"{Quote(imageName)} " +
+				string.Join(" ", entrypointArgs);
+
+			Console.WriteLine($"Using segmentation image: {imageName}, network: {dockerNetwork}, platform: {platform}");
+			Console.WriteLine($"docker {dockerArgs}");
+
+			var process = new Process
+			{
+				StartInfo = new ProcessStartInfo
+				{
+					FileName = "docker",
+					Arguments = dockerArgs,
 					RedirectStandardOutput = true,
 					RedirectStandardError = true,
 					UseShellExecute = false,
@@ -194,20 +462,26 @@ namespace WrapperApi.Services
 
 			try
 			{
-				_cache.MarkJobStarted(dbJob.Id.ToString());
 				process.Start();
-				var stdout = await process.StandardOutput.ReadToEndAsync();
-				var stderr = await process.StandardError.ReadToEndAsync();
-				process.WaitForExit();
-				_cache.MarkJobCompleted(dbJob.Id.ToString());
 
-				Console.WriteLine($"[DEBUG] Job {dbJob.Id} docker run exited with code {process.ExitCode}");
+				var stdoutTask = process.StandardOutput.ReadToEndAsync();
+				var stderrTask = process.StandardError.ReadToEndAsync();
+
+				await process.WaitForExitAsync();
+
+				var stdout = await stdoutTask;
+				var stderr = await stderrTask;
+
+				Console.WriteLine($"[DEBUG] Mesh job {dbJob.Id} docker run exited with code {process.ExitCode}");
 				Console.WriteLine($"[DEBUG] STDOUT: {stdout}");
 				Console.WriteLine($"[DEBUG] STDERR: {stderr}");
 
 				if (process.ExitCode != 0)
 				{
-					var err = string.IsNullOrWhiteSpace(stderr) ? "Unknown error occurred during execution." : stderr;
+					var err = string.IsNullOrWhiteSpace(stderr)
+						? $"Docker run failed with exit code {process.ExitCode}."
+						: stderr;
+
 					return (false, stdout, stderr, err);
 				}
 
@@ -215,7 +489,7 @@ namespace WrapperApi.Services
 			}
 			catch (Exception ex)
 			{
-				Console.WriteLine($"[ERROR] Exception when running docker for job {dbJob.Id}: {ex.Message}");
+				Console.WriteLine($"[ERROR] Exception when running mesh job {dbJob.Id}: {ex}");
 				return (false, string.Empty, string.Empty, ex.Message);
 			}
 		}
@@ -299,6 +573,14 @@ namespace WrapperApi.Services
 			// Otherwise fallback to last write time
 			var fallback = candidates.OrderByDescending(p => File.GetLastWriteTimeUtc(p)).FirstOrDefault();
 			return fallback;
+		}
+
+		private static string Quote(string s)
+		{
+			if (string.IsNullOrEmpty(s)) return "\"\"";
+			return s.Contains(' ') || s.Contains('"')
+				? "\"" + s.Replace("\"", "\\\"") + "\""
+				: s;
 		}
 		
 		private async Task<(bool Success, bool shouldRetry, string? Error)> SendResultToGatewayAsync(
@@ -391,4 +673,3 @@ namespace WrapperApi.Services
 		}
 	}
 }
-

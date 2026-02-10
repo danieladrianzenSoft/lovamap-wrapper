@@ -9,6 +9,7 @@ public class Job
     public int? ClientId { get; set; }
     public Client? Client { get; set; }
     public InitiatorType InitiatorType { get; set; } = InitiatorType.Unknown;
+    public JobType JobType{ get; set; } = JobType.Lovamap;
     public string FileName { get; set; } = null!;
     public JobStatus Status { get; set; } = 0;
     public DateTime SubmittedAt { get; set; } = DateTime.UtcNow;
@@ -19,10 +20,20 @@ public class Job
     public int Priority { get; set; } = 0; // Lower number = higher priority
     public string? ErrorMessage { get; set; }
     public string? HeartbeatMessage { get; set; }
+    public string? StdOut { get; set; }
+    public string? StdErr { get; set; }
     public DateTime? HeartbeatPostedAt { get; set; }
     public string? DxValue { get; set; } // Store the dx value if it varies per job
     public int RetryCount { get; set; } = 0;
     public int MaxRetries { get; set; } = 3;
+
+}
+
+public enum JobType
+{
+    Unknown = 0,
+    Lovamap = 1,
+    MeshProcessing = 2,
 
 }
 
