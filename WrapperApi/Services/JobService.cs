@@ -220,22 +220,23 @@ namespace WrapperApi.Services
 			var wrapperApiUrl  = Environment.GetEnvironmentVariable("WRAPPER_API_URL")     ?? "http://localhost:8080";
 			var heartbeatToken = Environment.GetEnvironmentVariable("HEARTBEAT_TOKEN")     ?? "sdf923lsd";
 			var dockerNetwork  = Environment.GetEnvironmentVariable("DOCKER_NETWORK_NAME") ?? "lovamap_core_network";
+			var runAsUid = Environment.GetEnvironmentVariable("JOB_RUN_AS_UID");
+			var runAsGid = Environment.GetEnvironmentVariable("JOB_RUN_AS_GID");
 
 			var imageName = Environment.GetEnvironmentVariable("LOVAMAP_IMAGE")
-						?? "ghcr.io/seguralab/lovamap:v1.0.4";
+						?? "ghcr.io/seguralab/lovamap:latest";
 
-			var lovamapCmd = Environment.GetEnvironmentVariable("LOVAMAP_CMD")
-						?? "/app/entrypoint.sh";
-			var useEntrypoint = string.Equals(lovamapCmd, "/app/entrypoint.sh", StringComparison.OrdinalIgnoreCase);
+			var entrypointPath =
+				Environment.GetEnvironmentVariable("LOVAMAP_ENTRYPOINT") ??
+				Environment.GetEnvironmentVariable("LOVAMAP_CMD") ??
+				"/app/entrypoint.sh";
 
 			var fileName = dbJob.FileName;
 
 			var heartbeatEndpoint = $"{wrapperApiUrl.TrimEnd('/')}/heartbeat";
 
-			// Build the entrypoint args
+			// Build the entrypoint args (always use entrypoint.sh)
 			var entrypointArgs = new List<string>();
-			if (!useEntrypoint)
-				entrypointArgs.Add(Quote(lovamapCmd));
 
 			entrypointArgs.AddRange(new[]
 			{
@@ -265,9 +266,10 @@ namespace WrapperApi.Services
 				$"--platform {Quote(platform)} " +
 				$"--name {Quote(containerName)} " +
 				$"--network {Quote(dockerNetwork)} " +
+				$"{(string.IsNullOrWhiteSpace(runAsUid) ? "" : $"--user {Quote(runAsGid is null or "" ? runAsUid : $"{runAsUid}:{runAsGid}")} ")}" +
 				$"-v {Quote(hostInputDir)}:/app/input " +
 				$"-v {Quote(hostOutputDir)}:/app/output " +
-				$"{(useEntrypoint ? $"--entrypoint {Quote(lovamapCmd)} " : "")}" +
+				$"--entrypoint {Quote(entrypointPath)} " +
 				$"-e LOVAMAP_INPUT_DIR=/app/input " +
 				$"-e LOVAMAP_OUTPUT_DIR=/app/output " +
 				$"-e HEARTBEAT_TOKEN={Quote(heartbeatToken)} " +
@@ -338,6 +340,8 @@ namespace WrapperApi.Services
 			var containerName = $"mesh-processing-job-{dbJob.Id}-{Guid.NewGuid()}";
 			var platform = Environment.GetEnvironmentVariable("PLATFORM") ?? "linux/amd64";
 			var dockerNetwork = Environment.GetEnvironmentVariable("DOCKER_NETWORK_NAME") ?? "lovamap_core_network";
+			var runAsUid = Environment.GetEnvironmentVariable("JOB_RUN_AS_UID");
+			var runAsGid = Environment.GetEnvironmentVariable("JOB_RUN_AS_GID");
 
 			var imageName = Environment.GetEnvironmentVariable("SEGMENTATION_WORKFLOWS_IMAGE");
 			if (string.IsNullOrWhiteSpace(imageName))
@@ -390,6 +394,7 @@ namespace WrapperApi.Services
 				$"--platform {Quote(platform)} " +
 				$"--name {Quote(containerName)} " +
 				$"--network {Quote(dockerNetwork)} " +
+				$"{(string.IsNullOrWhiteSpace(runAsUid) ? "" : $"--user {Quote(runAsGid is null or "" ? runAsUid : $"{runAsUid}:{runAsGid}")} ")}" +
 				$"-v {Quote(hostInputDir)}:/app/input " +
 				$"-v {Quote(hostOutputDir)}:/app/output " +
 				$"{(string.IsNullOrWhiteSpace(workflowEntrypoint) ? "" : $"--entrypoint {Quote(workflowEntrypoint)} ")}" +

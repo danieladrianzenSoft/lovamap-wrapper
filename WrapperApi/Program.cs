@@ -648,16 +648,10 @@ app.MapGet("/jobs/{jobId}/raw-results", async (string jobId, DataContext db, ILo
 
     try
     {
-        // Stream the file (raw bytes); GW will interpret as protobuf
+        // Stream the file to avoid loading large JSON payloads into memory.
         var stream = File.OpenRead(path);
-
-        // Use a generic content type; you can change this to application/x-protobuf if you like
-        const string contentType = "application/octet-stream";
-
-        // Optional: send a nice filename, but not required since GW only cares about bytes
-        var fileName = Path.GetFileName(path);
-
-        return Results.File(stream, contentType, fileName, enableRangeProcessing: false);
+        const string contentType = "application/json";
+        return Results.File(stream, contentType, enableRangeProcessing: false);
     }
     catch (Exception ex)
     {
