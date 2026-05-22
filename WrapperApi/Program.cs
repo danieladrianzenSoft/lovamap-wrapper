@@ -1,7 +1,9 @@
 using System.Security.Claims;
 using System.Text;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.Identity;
+using Microsoft.AspNetCore.Server.Kestrel.Core;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
 using WrapperApi.Data;
@@ -13,6 +15,19 @@ using System.Globalization;
 var builder = WebApplication.CreateBuilder(args);
 
 var config = builder.Configuration;
+
+// Allow large job uploads (e.g. non-spherical scaffold JSON inputs ~50 MB).
+// Defaults are 30 MB (Kestrel) and 128 MB (multipart form), so the JSON
+// uploads to /jobs would otherwise be rejected before reaching the handler.
+const long MaxUploadBytes = 524_288_000; // 500 MB
+builder.Services.Configure<KestrelServerOptions>(o =>
+{
+    o.Limits.MaxRequestBodySize = MaxUploadBytes;
+});
+builder.Services.Configure<FormOptions>(o =>
+{
+    o.MultipartBodyLengthLimit = MaxUploadBytes;
+});
 
 var connectionString = Environment.GetEnvironmentVariable("LOVAMAP_CORE_DB") 
     ?? builder.Configuration.GetConnectionString("LOVAMAP_CORE_DB")
@@ -372,7 +387,8 @@ app.MapGet("/jobs", async (HttpRequest request, DataContext db) =>
             DxValue = j.DxValue,
             RetryCount = j.RetryCount,
             MaxRetries = j.MaxRetries,
-            GenerateMesh = j.GenerateMesh
+            GenerateMesh = j.GenerateMesh,
+            SegmentationParams = j.SegmentationParams
         })
         .ToListAsync();
 
@@ -404,8 +420,12 @@ app.MapPost("/jobs", async (
         return Results.BadRequest("No file uploaded.");
 
 	var jobId = JobRequestParser.ParseJobId(form);
+    var jobType = JobRequestParser.ParseJobType(form);
     var dxValue = JobRequestParser.ParseDxValue(form);
     var generateMesh = JobRequestParser.ParseGenerateMesh(form);
+    var segmentationParams = jobType == JobType.ParticleSegmentation
+        ? JobRequestParser.ParseSegmentationParams(form)
+        : null;
 
     if (string.IsNullOrEmpty(jobId)) return Results.BadRequest("jobId is required");
     if (await db.Jobs.AnyAsync(j => j.JobId == jobId))
@@ -414,7 +434,8 @@ app.MapPost("/jobs", async (
 	string fileName;
     try
     {
-        fileName = await FileService.SaveUploadedFileAsync(file, inputDir);
+        fileName = await FileService.SaveUploadedFileAsync(file, inputDir,
+            allowImageFiles: jobType == JobType.ParticleSegmentation);
     }
     catch (InvalidOperationException ex)
     {
@@ -436,12 +457,13 @@ app.MapPost("/jobs", async (
     {
 		JobId = jobId,
         FileName = fileName,
-        JobType = JobType.Lovamap,
+        JobType = jobType,
         Status = JobStatus.Pending,
         SubmittedAt = DateTime.UtcNow,
         InitiatorType = initiatorType,
         DxValue = dxValue,
-        GenerateMesh = generateMesh
+        GenerateMesh = jobType == JobType.ParticleSegmentation ? false : generateMesh,
+        SegmentationParams = segmentationParams
     };
 
     if (job.InitiatorType == InitiatorType.Client)
@@ -505,7 +527,8 @@ app.MapPost("/jobs", async (
         StartedAt = job.StartedAt,
         UserId = job.UserId,
         ClientId = job.ClientId,
-        GenerateMesh = job.GenerateMesh
+        GenerateMesh = job.GenerateMesh,
+        SegmentationParams = job.SegmentationParams
     };
 
     return Results.Created($"/jobs/by-jobid/{job.JobId ?? job.Id.ToString()}", jobDto);

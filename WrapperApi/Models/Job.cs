@@ -27,6 +27,7 @@ public class Job
     public int RetryCount { get; set; } = 0;
     public int MaxRetries { get; set; } = 3;
     public bool GenerateMesh { get; set; } = true;
+    public string? SegmentationParams { get; set; }
 
 }
 
@@ -35,6 +36,7 @@ public enum JobType
     Unknown = 0,
     Lovamap = 1,
     MeshProcessing = 2,
+    ParticleSegmentation = 3,
 
 }
 

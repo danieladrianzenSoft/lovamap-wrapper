@@ -3,12 +3,14 @@ namespace WrapperApi.Services
     public static class FileService
     {
         private static readonly string[] AllowedExtensions = new[] { ".json", ".csv", ".dat" };
+        private static readonly string[] ImageExtensions = new[] { ".tif", ".tiff", ".lif", ".mat" };
 
-        public static async Task<string> SaveUploadedFileAsync(IFormFile file, string directory)
+        public static async Task<string> SaveUploadedFileAsync(IFormFile file, string directory, bool allowImageFiles = false)
         {
             var ext = Path.GetExtension(file.FileName).ToLower();
 
-            if (!AllowedExtensions.Contains(ext))
+            var allowed = allowImageFiles ? AllowedExtensions.Concat(ImageExtensions) : AllowedExtensions;
+            if (!allowed.Contains(ext))
                 throw new InvalidOperationException("Unsupported file type.");
 
             var fileName = $"{Guid.NewGuid()}{ext}";

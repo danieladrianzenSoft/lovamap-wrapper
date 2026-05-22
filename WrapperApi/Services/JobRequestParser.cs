@@ -1,5 +1,7 @@
+using System.Text.Json;
+using WrapperApi.Models;
 
-namespace WrapperApi.Services 
+namespace WrapperApi.Services
 {
     public static class JobRequestParser
     {
@@ -43,6 +45,35 @@ namespace WrapperApi.Services
             return lowered is "y" or "yes" ? true
                  : lowered is "n" or "no" ? false
                  : defaultValue;
+        }
+
+        public static JobType ParseJobType(IFormCollection form)
+        {
+            if (form.TryGetValue("jobType", out var jobTypeValue))
+            {
+                var raw = jobTypeValue.ToString().Trim();
+                if (Enum.TryParse<JobType>(raw, ignoreCase: true, out var parsed) && parsed != JobType.Unknown)
+                    return parsed;
+            }
+            return JobType.Lovamap;
+        }
+
+        public static string? ParseSegmentationParams(IFormCollection form)
+        {
+            var fields = new[] { "th", "radiusUm", "dxyz", "s2vMax", "dx", "dy", "dz", "fluorescentLabel", "cropBool", "channelNum" };
+            var dict = new Dictionary<string, string>();
+
+            foreach (var field in fields)
+            {
+                if (form.TryGetValue(field, out var val))
+                {
+                    var v = val.ToString().Trim();
+                    if (!string.IsNullOrEmpty(v))
+                        dict[field] = v;
+                }
+            }
+
+            return dict.Count > 0 ? JsonSerializer.Serialize(dict) : null;
         }
     }
 }

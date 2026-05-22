@@ -24,6 +24,7 @@ public class JobDto
     public int RetryCount { get; set; } = 0;
     public int MaxRetries { get; set; } = 3;
     public bool GenerateMesh { get; set; } = true;
+    public string? SegmentationParams { get; set; }
 
     // add only the fields you want to expose
 }

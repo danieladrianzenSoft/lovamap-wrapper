@@ -111,14 +111,17 @@ namespace WrapperApi.Services
 				}
 
 				// Compute
-				var computeResult = dbJob.JobType == JobType.MeshProcessing
-					? await RunMeshProcessingAsync(dbJob, hostInputDir, hostOutputDir)
-					: await RunComputationAsync(
+				var computeResult = dbJob.JobType switch
+				{
+					JobType.MeshProcessing => await RunMeshProcessingAsync(dbJob, hostInputDir, hostOutputDir),
+					JobType.ParticleSegmentation => await RunParticleSegmentationAsync(dbJob, hostInputDir, hostOutputDir),
+					_ => await RunComputationAsync(
 						dbJob,
 						dxValue,
 						hostInputDir,
 						hostOutputDir,
-						writePoreMeshes: dbJob.GenerateMesh);
+						writePoreMeshes: dbJob.GenerateMesh)
+				};
 				dbJob.CompletedAt = DateTime.UtcNow;
 				try
 				{
@@ -150,6 +153,30 @@ namespace WrapperApi.Services
 					// best-effort result path (entire job output directory)
 					var meshOutputDir = Path.Combine(_outputDir, baseName);
 					dbJob.ResultPath = Directory.Exists(meshOutputDir) ? meshOutputDir : null;
+					dbJob.JobUploadSucceeded = true;
+					await db.SaveChangesAsync();
+
+					return new JobRunResult(true, false, null);
+				}
+
+				if (dbJob.JobType == JobType.ParticleSegmentation)
+				{
+					dbJob.StdErr = computeResult.Stderr;
+					dbJob.StdOut = computeResult.Stdout;
+					dbJob.Status = JobStatus.Completed;
+					dbJob.CompletedAt = DateTime.UtcNow;
+
+					// Find output JSON in output/{baseName}/ directory
+					var segOutputDir = Path.Combine(_outputDir, baseName);
+					string? segResultPath = null;
+					if (Directory.Exists(segOutputDir))
+					{
+						segResultPath = Directory.EnumerateFiles(segOutputDir, "*.json", SearchOption.TopDirectoryOnly)
+							.OrderByDescending(f => File.GetLastWriteTimeUtc(f))
+							.FirstOrDefault();
+					}
+
+					dbJob.ResultPath = segResultPath;
 					dbJob.JobUploadSucceeded = true;
 					await db.SaveChangesAsync();
 
@@ -448,6 +475,130 @@ namespace WrapperApi.Services
 			catch (Exception ex)
 			{
 				Console.WriteLine($"[ERROR] Exception when running mesh job {dbJob.Id}: {ex}");
+				return (false, string.Empty, string.Empty, ex.Message);
+			}
+		}
+
+		private async Task<(bool Succeeded, string Stdout, string Stderr, string? ErrorMessage)>
+			RunParticleSegmentationAsync(
+				Job dbJob,
+				string hostInputDir,
+				string hostOutputDir)
+		{
+			var containerName = $"particle-seg-job-{dbJob.Id}-{Guid.NewGuid()}";
+			var platform = Environment.GetEnvironmentVariable("PLATFORM") ?? "linux/amd64";
+			var dockerNetwork = Environment.GetEnvironmentVariable("DOCKER_NETWORK_NAME") ?? "lovamap_core_network";
+			var runAsUid = Environment.GetEnvironmentVariable("JOB_RUN_AS_UID");
+			var runAsGid = Environment.GetEnvironmentVariable("JOB_RUN_AS_GID");
+
+			var imageName = Environment.GetEnvironmentVariable("PARTICLE_SEGMENTATION_IMAGE");
+			if (string.IsNullOrWhiteSpace(imageName))
+				return (false, string.Empty, string.Empty, "PARTICLE_SEGMENTATION_IMAGE is not set.");
+
+			var fileName = dbJob.FileName;
+
+			var entrypointArgs = new List<string>
+			{
+				"--filename", Quote(fileName),
+				"--no-plot",
+				"--no-mat"
+			};
+
+			// Parse stored segmentation params and convert to CLI flags
+			if (!string.IsNullOrWhiteSpace(dbJob.SegmentationParams))
+			{
+				try
+				{
+					var paramMap = new Dictionary<string, string>
+					{
+						["th"] = "--th",
+						["radiusUm"] = "--radius-um",
+						["dxyz"] = "--dxyz",
+						["s2vMax"] = "--s2v-max",
+						["dx"] = "--dx",
+						["dy"] = "--dy",
+						["dz"] = "--dz",
+						["fluorescentLabel"] = "--fluorescent-label",
+						["cropBool"] = "--crop-bool",
+						["channelNum"] = "--channel-num"
+					};
+
+					var parsed = System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, string>>(dbJob.SegmentationParams);
+					if (parsed != null)
+					{
+						foreach (var kvp in parsed)
+						{
+							if (paramMap.TryGetValue(kvp.Key, out var cliFlag) && !string.IsNullOrWhiteSpace(kvp.Value))
+							{
+								entrypointArgs.Add(cliFlag);
+								entrypointArgs.Add(Quote(kvp.Value));
+							}
+						}
+					}
+				}
+				catch (Exception ex)
+				{
+					Console.WriteLine($"[WARN] Failed to parse SegmentationParams for job {dbJob.Id}: {ex.Message}");
+				}
+			}
+
+			var dockerArgs =
+				"run --rm " +
+				$"--platform {Quote(platform)} " +
+				$"--name {Quote(containerName)} " +
+				$"--network {Quote(dockerNetwork)} " +
+				$"{(string.IsNullOrWhiteSpace(runAsUid) ? "" : $"--user {Quote(runAsGid is null or "" ? runAsUid : $"{runAsUid}:{runAsGid}")} ")}" +
+				$"-v {Quote(hostInputDir)}:/app/input " +
+				$"-v {Quote(hostOutputDir)}:/app/output " +
+				$"{Quote(imageName)} " +
+				string.Join(" ", entrypointArgs);
+
+			Console.WriteLine($"Using particle segmentation image: {imageName}, network: {dockerNetwork}, platform: {platform}");
+			Console.WriteLine($"docker {dockerArgs}");
+
+			var process = new Process
+			{
+				StartInfo = new ProcessStartInfo
+				{
+					FileName = "docker",
+					Arguments = dockerArgs,
+					RedirectStandardOutput = true,
+					RedirectStandardError = true,
+					UseShellExecute = false,
+					CreateNoWindow = true
+				}
+			};
+
+			try
+			{
+				process.Start();
+
+				var stdoutTask = process.StandardOutput.ReadToEndAsync();
+				var stderrTask = process.StandardError.ReadToEndAsync();
+
+				await process.WaitForExitAsync();
+
+				var stdout = await stdoutTask;
+				var stderr = await stderrTask;
+
+				Console.WriteLine($"[DEBUG] Particle segmentation job {dbJob.Id} docker run exited with code {process.ExitCode}");
+				Console.WriteLine($"[DEBUG] STDOUT: {stdout}");
+				Console.WriteLine($"[DEBUG] STDERR: {stderr}");
+
+				if (process.ExitCode != 0)
+				{
+					var err = string.IsNullOrWhiteSpace(stderr)
+						? $"Docker run failed with exit code {process.ExitCode}."
+						: stderr;
+
+					return (false, stdout, stderr, err);
+				}
+
+				return (true, stdout, stderr, null);
+			}
+			catch (Exception ex)
+			{
+				Console.WriteLine($"[ERROR] Exception when running particle segmentation job {dbJob.Id}: {ex}");
 				return (false, string.Empty, string.Empty, ex.Message);
 			}
 		}
