@@ -16,8 +16,21 @@ namespace WrapperApi.Services
             var fileName = $"{Guid.NewGuid()}{ext}";
             var filePath = Path.Combine(directory, fileName);
 
-            using var stream = File.Create(filePath);
-            await file.CopyToAsync(stream);
+            using (var inputStream = file.OpenReadStream())
+            using (var outputStream = File.Create(filePath))
+            {
+                await inputStream.CopyToAsync(outputStream);
+                await outputStream.FlushAsync();
+            }
+
+            // Verify the file was written correctly
+            var writtenSize = new FileInfo(filePath).Length;
+            if (writtenSize != file.Length)
+            {
+                Console.WriteLine($"[ERROR] File size mismatch: expected {file.Length}, got {writtenSize} for {filePath}");
+                File.Delete(filePath);
+                throw new InvalidOperationException($"File upload failed: size mismatch (expected {file.Length}, wrote {writtenSize}).");
+            }
 
             return fileName;
         }

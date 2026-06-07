@@ -58,6 +58,17 @@ namespace WrapperApi.Services
             return JobType.Lovamap;
         }
 
+        public static string? ParseMeshWorkflow(IFormCollection form)
+        {
+            if (form.TryGetValue("meshWorkflow", out var val))
+            {
+                var v = val.ToString().Trim();
+                if (v is "mesh_generation" or "unite_meshes")
+                    return v;
+            }
+            return null;
+        }
+
         public static string? ParseSegmentationParams(IFormCollection form)
         {
             var fields = new[] { "th", "radiusUm", "dxyz", "s2vMax", "dx", "dy", "dz", "fluorescentLabel", "cropBool", "channelNum" };

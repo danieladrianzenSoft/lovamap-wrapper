@@ -423,6 +423,9 @@ app.MapPost("/jobs", async (
     var jobType = JobRequestParser.ParseJobType(form);
     var dxValue = JobRequestParser.ParseDxValue(form);
     var generateMesh = JobRequestParser.ParseGenerateMesh(form);
+    var meshWorkflow = jobType == JobType.MeshProcessing
+        ? JobRequestParser.ParseMeshWorkflow(form)
+        : null;
     var segmentationParams = jobType == JobType.ParticleSegmentation
         ? JobRequestParser.ParseSegmentationParams(form)
         : null;
@@ -463,6 +466,7 @@ app.MapPost("/jobs", async (
         InitiatorType = initiatorType,
         DxValue = dxValue,
         GenerateMesh = jobType == JobType.ParticleSegmentation ? false : generateMesh,
+        MeshWorkflow = meshWorkflow,
         SegmentationParams = segmentationParams
     };
 
@@ -559,6 +563,63 @@ app.MapPost("/jobs/{jobId}/mesh-processing", async (
         JobId = meshJobId,
         FileName = sourceJob.FileName,
         JobType = JobType.MeshProcessing,
+        Status = JobStatus.Pending,
+        SubmittedAt = DateTime.UtcNow,
+        InitiatorType = sourceJob.InitiatorType,
+        UserId = sourceJob.UserId,
+        ClientId = sourceJob.ClientId,
+        DxValue = sourceJob.DxValue,
+        GenerateMesh = false
+    };
+
+    db.Jobs.Add(meshJob);
+    await db.SaveChangesAsync();
+
+    var dxValue = meshJob.DxValue ?? "4.0";
+    jobQueue.Enqueue(meshJob, dxValue, uploadUrl: null, uploadToken: null);
+
+    var meshJobDto = new JobDto {
+        Id = meshJob.Id,
+        JobId = meshJob.JobId,
+        FileName = meshJob.FileName,
+        JobType = meshJob.JobType,
+        Status = meshJob.Status,
+        SubmittedAt = meshJob.SubmittedAt,
+        StartedAt = meshJob.StartedAt,
+        UserId = meshJob.UserId,
+        ClientId = meshJob.ClientId,
+        GenerateMesh = meshJob.GenerateMesh
+    };
+
+    return Results.Accepted($"/jobs/by-jobid/{meshJob.JobId}", meshJobDto);
+}).AllowClientOrUser();
+
+// Trigger mesh generation (mesh_generation) for an existing segmentation job by JobId
+app.MapPost("/jobs/{jobId}/mesh-generation", async (
+    string jobId, DataContext db, ClaimsPrincipal user,
+    IBackgroundJobQueue jobQueue) =>
+{
+    var sourceJob = await db.Jobs.FirstOrDefaultAsync(j => j.JobId == jobId);
+    if (sourceJob == null)
+        return Results.NotFound($"No job found with JobId '{jobId}'.");
+
+    if (sourceJob.JobType != JobType.ParticleSegmentation)
+        return Results.BadRequest("Mesh generation can only be triggered from a ParticleSegmentation job.");
+
+    if (sourceJob.Status != JobStatus.Completed)
+        return Results.BadRequest("Source job must be Completed before mesh generation can run.");
+
+    var baseJobId = sourceJob.JobId ?? sourceJob.Id.ToString();
+    var meshJobId = $"{baseJobId}-mesh-gen";
+    if (await db.Jobs.AnyAsync(j => j.JobId == meshJobId))
+        meshJobId = $"{baseJobId}-mesh-gen-{Guid.NewGuid():N}";
+
+    var meshJob = new Job
+    {
+        JobId = meshJobId,
+        FileName = sourceJob.FileName,
+        JobType = JobType.MeshProcessing,
+        MeshWorkflow = "mesh_generation",
         Status = JobStatus.Pending,
         SubmittedAt = DateTime.UtcNow,
         InitiatorType = sourceJob.InitiatorType,

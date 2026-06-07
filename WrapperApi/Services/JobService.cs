@@ -180,6 +180,8 @@ namespace WrapperApi.Services
 					dbJob.JobUploadSucceeded = true;
 					await db.SaveChangesAsync();
 
+					await EnqueueMeshGenerationAfterSegmentationAsync(db, dbJob);
+
 					return new JobRunResult(true, false, null);
 				}
 
@@ -374,16 +376,15 @@ namespace WrapperApi.Services
 			if (string.IsNullOrWhiteSpace(imageName))
 				return (false, string.Empty, string.Empty, "SEGMENTATION_WORKFLOWS_IMAGE is not set.");
 
-			var workflowName = Environment.GetEnvironmentVariable("SEG_WORKFLOW_NAME") ?? "unite_meshes";
 			var workflowEntrypoint = Environment.GetEnvironmentVariable("SEG_WORKFLOW_ENTRYPOINT");
 			var workflowScript = Environment.GetEnvironmentVariable("SEG_WORKFLOW_SCRIPT");
 			var workflowMode = Environment.GetEnvironmentVariable("SEG_WORKFLOW_MODE");
 
 			var baseName = Path.GetFileNameWithoutExtension(dbJob.FileName);
 			var baseJobId = string.IsNullOrWhiteSpace(dbJob.JobId) ? dbJob.Id.ToString() : dbJob.JobId;
-			var hostConfigPath = Path.Combine(hostOutputDir, baseName, "unite_meshes.json");
-			var containerConfigPath = $"/app/output/{baseName}/unite_meshes.json";
-			var hasConfig = File.Exists(hostConfigPath);
+
+			// Determine which workflow to run based on job's MeshWorkflow field
+			var workflowName = dbJob.MeshWorkflow ?? Environment.GetEnvironmentVariable("SEG_WORKFLOW_NAME") ?? "unite_meshes";
 
 			var entrypointArgs = new List<string>();
 
@@ -397,23 +398,44 @@ namespace WrapperApi.Services
 
 			entrypointArgs.AddRange(new[] { "--workflow", Quote(workflowName) });
 
-			if (hasConfig)
+			if (workflowName == "mesh_generation")
 			{
-				entrypointArgs.Add("--config");
-				entrypointArgs.Add(Quote(containerConfigPath));
+				// mesh_generation workflow: converts segmentation JSON to GLB meshes
+				var meshInputDir = $"/app/output/{baseName}";
+				var meshOutputDir = $"/app/output/{baseName}";
+				entrypointArgs.AddRange(new[]
+				{
+					"--config", "/app/configs/mesh_generation.json",
+					"--set",
+					$"input_dir={Quote(meshInputDir)}",
+					$"output_dir={Quote(meshOutputDir)}"
+				});
 			}
 			else
 			{
-				var meshOutputDir = $"/app/output/{baseName}";
-				var meshInputDir = $"{meshOutputDir}/pores";
-				var outputName = $"{baseJobId}_pores.glb";
-				entrypointArgs.AddRange(new[]
+				// unite_meshes workflow (default): combines pore meshes into single GLB
+				var hostConfigPath = Path.Combine(hostOutputDir, baseName, "unite_meshes.json");
+				var containerConfigPath = $"/app/output/{baseName}/unite_meshes.json";
+				var hasConfig = File.Exists(hostConfigPath);
+
+				if (hasConfig)
 				{
-					"--set",
-					$"input_dir={Quote(meshInputDir)}",
-					$"output_dir={Quote(meshOutputDir)}",
-					$"output_name={Quote(outputName)}"
-				});
+					entrypointArgs.Add("--config");
+					entrypointArgs.Add(Quote(containerConfigPath));
+				}
+				else
+				{
+					var meshOutputDir = $"/app/output/{baseName}";
+					var meshInputDir = $"{meshOutputDir}/pores";
+					var outputName = $"{baseJobId}_pores.glb";
+					entrypointArgs.AddRange(new[]
+					{
+						"--set",
+						$"input_dir={Quote(meshInputDir)}",
+						$"output_dir={Quote(meshOutputDir)}",
+						$"output_name={Quote(outputName)}"
+					});
+				}
 			}
 
 			var dockerArgs =
@@ -429,7 +451,7 @@ namespace WrapperApi.Services
 				$"{Quote(imageName)} " +
 				string.Join(" ", entrypointArgs);
 
-			Console.WriteLine($"Using segmentation image: {imageName}, network: {dockerNetwork}, platform: {platform}");
+			Console.WriteLine($"Using segmentation image: {imageName}, workflow: {workflowName}, network: {dockerNetwork}, platform: {platform}");
 			Console.WriteLine($"docker {dockerArgs}");
 
 			var process = new Process
@@ -675,7 +697,55 @@ namespace WrapperApi.Services
 			_jobQueue.Enqueue(meshJob, meshDxValue, uploadUrl: null, uploadToken: null);
 			Console.WriteLine($"[QUEUE] Enqueued mesh processing job {meshJob.Id} for lovamap job {dbJob.Id}.");
 		}
-		
+
+		private async Task EnqueueMeshGenerationAfterSegmentationAsync(DataContext db, Job dbJob)
+		{
+			if (dbJob.JobType != JobType.ParticleSegmentation || dbJob.Status != JobStatus.Completed)
+				return;
+
+			var baseJobId = dbJob.JobId ?? dbJob.Id.ToString();
+			var meshJobPrefix = $"{baseJobId}-mesh-gen";
+
+			var existingMesh = await db.Jobs.AnyAsync(j =>
+				j.JobType == JobType.MeshProcessing &&
+				j.MeshWorkflow == "mesh_generation" &&
+				j.JobId != null &&
+				j.JobId.StartsWith(meshJobPrefix) &&
+				(j.Status == JobStatus.Pending || j.Status == JobStatus.Running || j.Status == JobStatus.Completed));
+
+			if (existingMesh)
+			{
+				Console.WriteLine($"[QUEUE] Mesh generation already exists for segmentation job {dbJob.Id}; skipping auto-enqueue.");
+				return;
+			}
+
+			var meshJobId = meshJobPrefix;
+			if (await db.Jobs.AnyAsync(j => j.JobId == meshJobId))
+				meshJobId = $"{meshJobPrefix}-{Guid.NewGuid():N}";
+
+			var meshJob = new Job
+			{
+				JobId = meshJobId,
+				FileName = dbJob.FileName,
+				JobType = JobType.MeshProcessing,
+				MeshWorkflow = "mesh_generation",
+				Status = JobStatus.Pending,
+				SubmittedAt = DateTime.UtcNow,
+				InitiatorType = dbJob.InitiatorType,
+				UserId = dbJob.UserId,
+				ClientId = dbJob.ClientId,
+				DxValue = dbJob.DxValue,
+				GenerateMesh = false
+			};
+
+			db.Jobs.Add(meshJob);
+			await db.SaveChangesAsync();
+
+			var meshDxValue = meshJob.DxValue ?? "4.0";
+			_jobQueue.Enqueue(meshJob, meshDxValue, uploadUrl: null, uploadToken: null);
+			Console.WriteLine($"[QUEUE] Enqueued mesh generation job {meshJob.Id} for segmentation job {dbJob.Id}.");
+		}
+
 		private string? FindLatestOutputFile(string outputRootDir, string baseName)
 		{
 			if (string.IsNullOrEmpty(outputRootDir) || string.IsNullOrEmpty(baseName))
