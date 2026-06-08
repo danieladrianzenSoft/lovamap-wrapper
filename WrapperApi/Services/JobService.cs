@@ -401,15 +401,26 @@ namespace WrapperApi.Services
 			if (workflowName == "mesh_generation")
 			{
 				// mesh_generation workflow: converts segmentation JSON to GLB meshes
-				var meshInputDir = $"/app/output/{baseName}";
-				var meshOutputDir = $"/app/output/{baseName}";
-				entrypointArgs.AddRange(new[]
+				var hostConfigPath = Path.Combine(hostOutputDir, baseName, "mesh_generation.json");
+				var containerConfigPath = $"/app/output/{baseName}/mesh_generation.json";
+				var hasConfig = File.Exists(hostConfigPath);
+
+				if (hasConfig)
 				{
-					"--config", "/app/configs/mesh_generation.json",
-					"--set",
-					$"input_dir={Quote(meshInputDir)}",
-					$"output_dir={Quote(meshOutputDir)}"
-				});
+					entrypointArgs.Add("--config");
+					entrypointArgs.Add(Quote(containerConfigPath));
+				}
+				else
+				{
+					var meshInputDir = $"/app/output/{baseName}";
+					var meshOutputDir = $"/app/output/{baseName}";
+					entrypointArgs.AddRange(new[]
+					{
+						"--set",
+						$"input_dir={Quote(meshInputDir)}",
+						$"output_dir={Quote(meshOutputDir)}"
+					});
+				}
 			}
 			else
 			{
