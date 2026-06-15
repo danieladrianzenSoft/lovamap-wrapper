@@ -27,6 +27,7 @@ builder.Services.Configure<KestrelServerOptions>(o =>
 builder.Services.Configure<FormOptions>(o =>
 {
     o.MultipartBodyLengthLimit = MaxUploadBytes;
+    o.MemoryBufferThreshold = 100 * 1024 * 1024; // 100 MB — keep uploads in memory to avoid temp file issues
 });
 
 var connectionString = Environment.GetEnvironmentVariable("LOVAMAP_CORE_DB") 
@@ -388,7 +389,9 @@ app.MapGet("/jobs", async (HttpRequest request, DataContext db) =>
             RetryCount = j.RetryCount,
             MaxRetries = j.MaxRetries,
             GenerateMesh = j.GenerateMesh,
-            SegmentationParams = j.SegmentationParams
+            GenerateParticleMesh = j.GenerateParticleMesh,
+            SegmentationParams = j.SegmentationParams,
+            SourceJobId = j.SourceJobId
         })
         .ToListAsync();
 
@@ -416,13 +419,12 @@ app.MapPost("/jobs", async (
     var form = await request.ReadFormAsync();
     var file = form.Files.GetFile("file");
 
-    if (file == null || file.Length == 0)
-        return Results.BadRequest("No file uploaded.");
-
 	var jobId = JobRequestParser.ParseJobId(form);
+    var sourceJobId = JobRequestParser.ParseSourceJobId(form);
     var jobType = JobRequestParser.ParseJobType(form);
     var dxValue = JobRequestParser.ParseDxValue(form);
     var generateMesh = JobRequestParser.ParseGenerateMesh(form);
+    var generateParticleMesh = JobRequestParser.ParseGenerateParticleMesh(form);
     var meshWorkflow = jobType == JobType.MeshProcessing
         ? JobRequestParser.ParseMeshWorkflow(form)
         : null;
@@ -435,14 +437,44 @@ app.MapPost("/jobs", async (
         return Results.Conflict("A job with this JobId already exists.");
 
 	string fileName;
-    try
+    if (!string.IsNullOrEmpty(sourceJobId))
     {
-        fileName = await FileService.SaveUploadedFileAsync(file, inputDir,
-            allowImageFiles: jobType == JobType.ParticleSegmentation);
+        // Source job chaining: resolve input from a completed job's output
+        var sourceJob = await db.Jobs.AsNoTracking().FirstOrDefaultAsync(j => j.JobId == sourceJobId);
+        if (sourceJob == null)
+            return Results.NotFound($"Source job '{sourceJobId}' not found.");
+
+        if (sourceJob.Status != JobStatus.Completed)
+            return Results.BadRequest($"Source job '{sourceJobId}' must be Completed (current: {sourceJob.Status}).");
+
+        if (string.IsNullOrWhiteSpace(sourceJob.ResultPath))
+            return Results.BadRequest($"Source job '{sourceJobId}' has no output file.");
+
+        try
+        {
+            fileName = FileService.ResolveSourceJobFile(sourceJob.ResultPath, inputDir);
+        }
+        catch (FileNotFoundException ex)
+        {
+            return Results.BadRequest(ex.Message);
+        }
     }
-    catch (InvalidOperationException ex)
+    else if (file != null && file.Length > 0)
     {
-        return Results.BadRequest(ex.Message);
+        // Standard file upload
+        try
+        {
+            fileName = await FileService.SaveUploadedFileAsync(file, inputDir,
+                allowImageFiles: jobType == JobType.ParticleSegmentation);
+        }
+        catch (InvalidOperationException ex)
+        {
+            return Results.BadRequest(ex.Message);
+        }
+    }
+    else
+    {
+        return Results.BadRequest("Provide either 'file' or 'sourceJobId'.");
     }
 
     var tokenType = user?.FindFirst("tokenType")?.Value; // "user" or "client"
@@ -466,8 +498,10 @@ app.MapPost("/jobs", async (
         InitiatorType = initiatorType,
         DxValue = dxValue,
         GenerateMesh = jobType == JobType.ParticleSegmentation ? false : generateMesh,
+        GenerateParticleMesh = jobType == JobType.Lovamap ? generateParticleMesh : false,
         MeshWorkflow = meshWorkflow,
-        SegmentationParams = segmentationParams
+        SegmentationParams = segmentationParams,
+        SourceJobId = sourceJobId
     };
 
     if (job.InitiatorType == InitiatorType.Client)
@@ -532,7 +566,9 @@ app.MapPost("/jobs", async (
         UserId = job.UserId,
         ClientId = job.ClientId,
         GenerateMesh = job.GenerateMesh,
-        SegmentationParams = job.SegmentationParams
+        GenerateParticleMesh = job.GenerateParticleMesh,
+        SegmentationParams = job.SegmentationParams,
+        SourceJobId = job.SourceJobId
     };
 
     return Results.Created($"/jobs/by-jobid/{job.JobId ?? job.Id.ToString()}", jobDto);
@@ -554,9 +590,9 @@ app.MapPost("/jobs/{jobId}/mesh-processing", async (
         return Results.BadRequest("Source job must be Completed before mesh processing can run.");
 
     var baseJobId = sourceJob.JobId ?? sourceJob.Id.ToString();
-    var meshJobId = $"{baseJobId}-mesh";
+    var meshJobId = $"{baseJobId}-mesh-unite";
     if (await db.Jobs.AnyAsync(j => j.JobId == meshJobId))
-        meshJobId = $"{baseJobId}-mesh-{Guid.NewGuid():N}";
+        meshJobId = $"{baseJobId}-mesh-unite-{Guid.NewGuid():N}";
 
     var meshJob = new Job
     {
@@ -698,6 +734,58 @@ app.MapDelete("/jobs", async (HttpRequest request, DataContext db) =>
     });
 }).AllowUserRoles("Admin");
 
+// Cancel a job (stops running container or prevents pending job from executing)
+app.MapPost("/jobs/{jobId}/cancel", async (string jobId, DataContext db, JobService jobService) =>
+{
+    var job = await db.Jobs.FirstOrDefaultAsync(j => j.JobId == jobId);
+    if (job == null)
+        return Results.NotFound($"No job found with JobId '{jobId}'.");
+
+    if (job.Status == JobStatus.Completed || job.Status == JobStatus.Failed || job.Status == JobStatus.Stopped)
+        return Results.BadRequest($"Job is not cancellable (current status: {job.Status}).");
+
+    var cancelled = await jobService.CancelJobAsync(job.Id);
+    if (!cancelled)
+        return Results.Problem("Failed to cancel the job.", statusCode: 500);
+
+    // Reload to get updated status
+    await db.Entry(job).ReloadAsync();
+
+    return Results.Ok(new
+    {
+        job.Id,
+        job.JobId,
+        Status = job.Status.ToString(),
+        Message = "Job cancelled successfully"
+    });
+}).AllowClientOrUser();
+
+// Delete a single job (non-running only)
+app.MapDelete("/jobs/{jobId}", async (string jobId, DataContext db) =>
+{
+    var job = await db.Jobs.FirstOrDefaultAsync(j => j.JobId == jobId);
+    if (job == null)
+        return Results.NotFound($"No job found with JobId '{jobId}'.");
+
+    if (job.Status == JobStatus.Running)
+        return Results.BadRequest("Cannot delete a running job. Cancel the job first.");
+
+    var inputFileDeleted = FileService.DeleteInputFile(inputDir, job.FileName);
+    var outputDirsDeleted = FileService.DeleteMatchingOutputDirs(outputDir, job.FileName);
+
+    db.Jobs.Remove(job);
+    await db.SaveChangesAsync();
+
+    return Results.Ok(new
+    {
+        job.Id,
+        job.JobId,
+        InputFileDeleted = inputFileDeleted,
+        OutputDirsDeleted = outputDirsDeleted,
+        Message = "Job deleted successfully"
+    });
+}).AllowUserRoles("Admin");
+
 app.MapGet("/jobs/{jobId}/raw-results", async (string jobId, DataContext db, ILogger<Program> logger) =>
 {
 	if (string.IsNullOrWhiteSpace(jobId))
@@ -767,7 +855,20 @@ app.MapGet("/jobs/{jobId}/mesh", async (string jobId, DataContext db, ILogger<Pr
     else if (job.JobType == JobType.Lovamap)
     {
         var baseJobId = job.JobId ?? job.Id.ToString();
-        var meshJobPrefix = $"{baseJobId}-mesh";
+        var meshJobPrefix = $"{baseJobId}-mesh-unite";
+
+        meshJob = await db.Jobs
+            .AsNoTracking()
+            .Where(j => j.JobType == JobType.MeshProcessing &&
+                        j.JobId != null &&
+                        j.JobId.StartsWith(meshJobPrefix))
+            .OrderByDescending(j => j.SubmittedAt)
+            .FirstOrDefaultAsync();
+    }
+    else if (job.JobType == JobType.ParticleSegmentation)
+    {
+        var baseJobId = job.JobId ?? job.Id.ToString();
+        var meshJobPrefix = $"{baseJobId}-mesh-gen";
 
         meshJob = await db.Jobs
             .AsNoTracking()
@@ -792,7 +893,24 @@ app.MapGet("/jobs/{jobId}/mesh", async (string jobId, DataContext db, ILogger<Pr
 
     var baseName = Path.GetFileNameWithoutExtension(meshJob.FileName);
     var baseJobIdForOutput = meshJob.JobId ?? meshJob.Id.ToString();
-    var meshPath = Path.Combine(outputDir, baseName, $"{baseJobIdForOutput}_pores.glb");
+
+    // mesh_generation output name varies — find the .glb in the directory
+    string? meshPath = null;
+    var jobOutputDir = Path.Combine(outputDir, baseName);
+
+    if (meshJob.MeshWorkflow == "mesh_generation")
+    {
+        if (Directory.Exists(jobOutputDir))
+        {
+            meshPath = Directory.EnumerateFiles(jobOutputDir, "*.glb", SearchOption.TopDirectoryOnly)
+                .OrderByDescending(f => File.GetLastWriteTimeUtc(f))
+                .FirstOrDefault();
+        }
+    }
+    else
+    {
+        meshPath = Path.Combine(jobOutputDir, $"{baseJobIdForOutput}_pores.glb");
+    }
 
     if (!File.Exists(meshPath))
     {

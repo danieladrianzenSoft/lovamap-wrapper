@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Globalization;
 using Microsoft.EntityFrameworkCore;
@@ -17,6 +18,7 @@ namespace WrapperApi.Services
 		private readonly string _outputDir;
 		private readonly IHttpClientFactory _httpClientFactory;
 		private readonly IBackgroundJobQueue _jobQueue;
+		private readonly ConcurrentDictionary<int, string> _runningContainers = new();
 		private HttpClient CreateClient() => _httpClientFactory.CreateClient();
 
 		public JobService(IServiceScopeFactory scopeFactory, IWebHostEnvironment env,
@@ -42,6 +44,9 @@ namespace WrapperApi.Services
 				return new JobRunResult(false, false, "Skipped in development mode");
 			}
 
+			var disableUpload = Environment.GetEnvironmentVariable("DISABLE_RESULT_UPLOAD")
+				?.Equals("true", StringComparison.OrdinalIgnoreCase) ?? false;
+
 			using var scope = _scopeFactory.CreateScope();
 			var db = scope.ServiceProvider.GetRequiredService<DataContext>();
 			Job? dbJob = null;
@@ -61,9 +66,11 @@ namespace WrapperApi.Services
 				// Early upload-only retry if computation already completed but upload didn't
 				if (dbJob.Status == JobStatus.Completed && dbJob.JobUploadSucceeded == false)
 				{
-					if (string.IsNullOrWhiteSpace(uploadUrl) || string.IsNullOrWhiteSpace(uploadToken))
+					if (disableUpload || string.IsNullOrWhiteSpace(uploadUrl) || string.IsNullOrWhiteSpace(uploadToken))
 					{
-						Console.WriteLine($"[INFO] Job {dbJob.Id} completed and upload skipped (missing uploadUrl/uploadToken).");
+						Console.WriteLine($"[INFO] Job {dbJob.Id} completed — upload skipped (uploads disabled or no URL).");
+						dbJob.JobUploadSucceeded = true;
+						await db.SaveChangesAsync();
 						return new JobRunResult(true, false, null);
 					}
 
@@ -134,6 +141,11 @@ namespace WrapperApi.Services
 
 				if (!computeResult.Succeeded)
 				{
+					// Check if the job was cancelled while running
+					await db.Entry(dbJob).ReloadAsync();
+					if (dbJob.Status == JobStatus.Stopped)
+						return new JobRunResult(false, false, "Job was cancelled");
+
 					// Computation error, retry
 					dbJob.Status = JobStatus.Failed;
 					dbJob.ErrorMessage = computeResult.ErrorMessage ?? "[COMPUTE] Unknown error during computation";
@@ -155,6 +167,9 @@ namespace WrapperApi.Services
 					dbJob.ResultPath = Directory.Exists(meshOutputDir) ? meshOutputDir : null;
 					dbJob.JobUploadSucceeded = true;
 					await db.SaveChangesAsync();
+
+					// Mesh processing is a terminal job — sync everything to NFS and clean up local
+					FireAndForgetNfsSync(baseName, dbJob.FileName, dbJob.Id, removeOutput: true);
 
 					return new JobRunResult(true, false, null);
 				}
@@ -181,6 +196,9 @@ namespace WrapperApi.Services
 					await db.SaveChangesAsync();
 
 					await EnqueueMeshGenerationAfterSegmentationAsync(db, dbJob);
+
+					// Don't remove output — mesh_generation needs the segmentation files
+					FireAndForgetNfsSync(baseName, dbJob.FileName, dbJob.Id, removeOutput: false);
 
 					return new JobRunResult(true, false, null);
 				}
@@ -209,11 +227,15 @@ namespace WrapperApi.Services
 				await db.SaveChangesAsync();
 
 				await EnqueueMeshProcessingIfNeededAsync(db, dbJob);
+				await EnqueueParticleMeshGenerationIfNeededAsync(db, dbJob);
 
-				if (string.IsNullOrWhiteSpace(uploadUrl) || string.IsNullOrWhiteSpace(uploadToken))
+				// Sync to NFS — don't remove output if mesh processing will need it
+				FireAndForgetNfsSync(baseName, dbJob.FileName, dbJob.Id, removeOutput: !dbJob.GenerateMesh && !dbJob.GenerateParticleMesh);
+
+				if (disableUpload || string.IsNullOrWhiteSpace(uploadUrl) || string.IsNullOrWhiteSpace(uploadToken))
 				{
-					Console.WriteLine($"[INFO] Job {dbJob.Id} completed and upload skipped (missing uploadUrl/uploadToken).");
-					dbJob.JobUploadSucceeded = false;
+					Console.WriteLine($"[INFO] Job {dbJob.Id} completed — upload skipped (uploads disabled or no URL).");
+					dbJob.JobUploadSucceeded = true;
 					await db.SaveChangesAsync();
 					return new JobRunResult(true, false, null);
 				}
@@ -232,6 +254,51 @@ namespace WrapperApi.Services
 				}
 				return new JobRunResult(false, true, ex.Message);
 			}
+		}
+
+		public async Task<bool> CancelJobAsync(int jobId)
+		{
+			// Stop the Docker container if running
+			if (_runningContainers.TryGetValue(jobId, out var containerName))
+			{
+				Console.WriteLine($"[CANCEL] Stopping container {containerName} for job {jobId}");
+				try
+				{
+					var stopProcess = new Process
+					{
+						StartInfo = new ProcessStartInfo
+						{
+							FileName = "docker",
+							Arguments = $"stop -t 10 {containerName}",
+							RedirectStandardOutput = true,
+							RedirectStandardError = true,
+							UseShellExecute = false,
+							CreateNoWindow = true
+						}
+					};
+					stopProcess.Start();
+					await stopProcess.WaitForExitAsync();
+					Console.WriteLine($"[CANCEL] Container {containerName} stopped (exit code {stopProcess.ExitCode})");
+				}
+				catch (Exception ex)
+				{
+					Console.WriteLine($"[CANCEL] Failed to stop container {containerName}: {ex.Message}");
+				}
+			}
+
+			// Mark job as Stopped in DB
+			using var scope = _scopeFactory.CreateScope();
+			var db = scope.ServiceProvider.GetRequiredService<DataContext>();
+			var dbJob = await db.Jobs.FindAsync(jobId);
+			if (dbJob == null)
+				return false;
+
+			dbJob.Status = JobStatus.Stopped;
+			dbJob.CompletedAt = DateTime.UtcNow;
+			dbJob.ErrorMessage = "Job cancelled by user";
+			await db.SaveChangesAsync();
+			Console.WriteLine($"[CANCEL] Job {jobId} marked as Stopped");
+			return true;
 		}
 
 		private async Task<(bool Succeeded, string Stdout, string Stderr, string? ErrorMessage)>
@@ -327,6 +394,7 @@ namespace WrapperApi.Services
 				_cache.MarkJobStarted(dbJob.Id.ToString());
 
 				process.Start();
+				_runningContainers[dbJob.Id] = containerName;
 
 				var stdoutTask = process.StandardOutput.ReadToEndAsync();
 				var stderrTask = process.StandardError.ReadToEndAsync();
@@ -357,6 +425,10 @@ namespace WrapperApi.Services
 			{
 				Console.WriteLine($"[ERROR] Exception when running docker for job {dbJob.Id}: {ex}");
 				return (false, string.Empty, string.Empty, ex.Message);
+			}
+			finally
+			{
+				_runningContainers.TryRemove(dbJob.Id, out _);
 			}
 		}
 
@@ -401,9 +473,34 @@ namespace WrapperApi.Services
 			if (workflowName == "mesh_generation")
 			{
 				// mesh_generation workflow: converts segmentation JSON to GLB meshes
-				var hostConfigPath = Path.Combine(hostOutputDir, baseName, "mesh_generation.json");
+				// Use wrapperapi's local mount paths for file operations
+				// (hostInputDir/hostOutputDir are HOST paths, only valid for docker -v args)
+				var localJobOutputDir = Path.Combine(_outputDir, baseName);
+				if (!Directory.Exists(localJobOutputDir))
+				{
+					Directory.CreateDirectory(localJobOutputDir);
+					// Make writable by the job container's appuser
+					File.SetUnixFileMode(localJobOutputDir,
+						UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute |
+						UnixFileMode.GroupRead | UnixFileMode.GroupWrite | UnixFileMode.GroupExecute |
+						UnixFileMode.OtherRead | UnixFileMode.OtherWrite | UnixFileMode.OtherExecute);
+				}
+
+				// If the input file is in the input dir (standalone upload), copy it
+				// to the output dir so the workflow container can find it
+				var localInputFile = Path.Combine(_inputDir, dbJob.FileName);
+				var inputExt = Path.GetExtension(localInputFile);
+				var meshGenExtensions = new[] { ".json", ".dat", ".npz", ".txt" };
+				if (File.Exists(localInputFile) && meshGenExtensions.Any(e => inputExt.Equals(e, StringComparison.OrdinalIgnoreCase)))
+				{
+					var destFile = Path.Combine(localJobOutputDir, dbJob.FileName);
+					if (!File.Exists(destFile))
+						File.Copy(localInputFile, destFile);
+				}
+
+				var localConfigPath = Path.Combine(_outputDir, baseName, "mesh_generation.json");
 				var containerConfigPath = $"/app/output/{baseName}/mesh_generation.json";
-				var hasConfig = File.Exists(hostConfigPath);
+				var hasConfig = File.Exists(localConfigPath);
 
 				if (hasConfig)
 				{
@@ -414,11 +511,22 @@ namespace WrapperApi.Services
 				{
 					var meshInputDir = $"/app/output/{baseName}";
 					var meshOutputDir = $"/app/output/{baseName}";
+
+					var inputExtNorm = Path.GetExtension(dbJob.FileName).TrimStart('.').ToLowerInvariant();
+					var fileType = inputExtNorm switch
+					{
+						"json" => "json",
+						"dat" => "dat",
+						"npz" => "npz",
+						_ => "json"
+					};
+
 					entrypointArgs.AddRange(new[]
 					{
 						"--set",
 						$"input_dir={Quote(meshInputDir)}",
-						$"output_dir={Quote(meshOutputDir)}"
+						$"output_dir={Quote(meshOutputDir)}",
+						$"file_type={Quote(fileType)}"
 					});
 				}
 			}
@@ -481,6 +589,7 @@ namespace WrapperApi.Services
 			try
 			{
 				process.Start();
+				_runningContainers[dbJob.Id] = containerName;
 
 				var stdoutTask = process.StandardOutput.ReadToEndAsync();
 				var stderrTask = process.StandardError.ReadToEndAsync();
@@ -509,6 +618,10 @@ namespace WrapperApi.Services
 			{
 				Console.WriteLine($"[ERROR] Exception when running mesh job {dbJob.Id}: {ex}");
 				return (false, string.Empty, string.Empty, ex.Message);
+			}
+			finally
+			{
+				_runningContainers.TryRemove(dbJob.Id, out _);
 			}
 		}
 
@@ -605,6 +718,7 @@ namespace WrapperApi.Services
 			try
 			{
 				process.Start();
+				_runningContainers[dbJob.Id] = containerName;
 
 				var stdoutTask = process.StandardOutput.ReadToEndAsync();
 				var stderrTask = process.StandardError.ReadToEndAsync();
@@ -633,6 +747,10 @@ namespace WrapperApi.Services
 			{
 				Console.WriteLine($"[ERROR] Exception when running particle segmentation job {dbJob.Id}: {ex}");
 				return (false, string.Empty, string.Empty, ex.Message);
+			}
+			finally
+			{
+				_runningContainers.TryRemove(dbJob.Id, out _);
 			}
 		}
 
@@ -669,7 +787,7 @@ namespace WrapperApi.Services
 				return;
 
 			var baseJobId = dbJob.JobId ?? dbJob.Id.ToString();
-			var meshJobPrefix = $"{baseJobId}-mesh";
+			var meshJobPrefix = $"{baseJobId}-mesh-unite";
 
 			var existingMesh = await db.Jobs.AnyAsync(j =>
 				j.JobType == JobType.MeshProcessing &&
@@ -757,6 +875,62 @@ namespace WrapperApi.Services
 			Console.WriteLine($"[QUEUE] Enqueued mesh generation job {meshJob.Id} for segmentation job {dbJob.Id}.");
 		}
 
+		private async Task EnqueueParticleMeshGenerationIfNeededAsync(DataContext db, Job dbJob)
+		{
+			if (dbJob.JobType != JobType.Lovamap || !dbJob.GenerateParticleMesh || dbJob.Status != JobStatus.Completed)
+				return;
+
+			// Skip if this job was chained from a segmentation job — mesh already exists
+			if (!string.IsNullOrWhiteSpace(dbJob.SourceJobId))
+			{
+				Console.WriteLine($"[QUEUE] Skipping particle mesh generation for job {dbJob.Id}: has sourceJobId '{dbJob.SourceJobId}'.");
+				return;
+			}
+
+			var baseJobId = dbJob.JobId ?? dbJob.Id.ToString();
+			var meshJobPrefix = $"{baseJobId}-mesh-gen";
+
+			var existingMesh = await db.Jobs.AnyAsync(j =>
+				j.JobType == JobType.MeshProcessing &&
+				j.MeshWorkflow == "mesh_generation" &&
+				j.JobId != null &&
+				j.JobId.StartsWith(meshJobPrefix) &&
+				(j.Status == JobStatus.Pending || j.Status == JobStatus.Running || j.Status == JobStatus.Completed));
+
+			if (existingMesh)
+			{
+				Console.WriteLine($"[QUEUE] Particle mesh generation already exists for job {dbJob.Id}; skipping auto-enqueue.");
+				return;
+			}
+
+			var meshJobId = meshJobPrefix;
+			if (await db.Jobs.AnyAsync(j => j.JobId == meshJobId))
+				meshJobId = $"{meshJobPrefix}-{Guid.NewGuid():N}";
+
+			var meshJob = new Job
+			{
+				JobId = meshJobId,
+				FileName = dbJob.FileName,
+				JobType = JobType.MeshProcessing,
+				MeshWorkflow = "mesh_generation",
+				Status = JobStatus.Pending,
+				SubmittedAt = DateTime.UtcNow,
+				InitiatorType = dbJob.InitiatorType,
+				UserId = dbJob.UserId,
+				ClientId = dbJob.ClientId,
+				DxValue = dbJob.DxValue,
+				GenerateMesh = false,
+				GenerateParticleMesh = false
+			};
+
+			db.Jobs.Add(meshJob);
+			await db.SaveChangesAsync();
+
+			var meshDxValue = meshJob.DxValue ?? "4.0";
+			_jobQueue.Enqueue(meshJob, meshDxValue, uploadUrl: null, uploadToken: null);
+			Console.WriteLine($"[QUEUE] Enqueued particle mesh generation job {meshJob.Id} ({meshJob.JobId}) for lovamap job {dbJob.Id}.");
+		}
+
 		private string? FindLatestOutputFile(string outputRootDir, string baseName)
 		{
 			if (string.IsNullOrEmpty(outputRootDir) || string.IsNullOrEmpty(baseName))
@@ -811,6 +985,82 @@ namespace WrapperApi.Services
 			// Otherwise fallback to last write time
 			var fallback = candidates.OrderByDescending(p => File.GetLastWriteTimeUtc(p)).FirstOrDefault();
 			return fallback;
+		}
+
+		/// <summary>
+		/// Fire-and-forget: spawns an Alpine container to copy job files from local disk to NFS.
+		/// Logs warnings on failure but never throws or blocks the caller.
+		/// </summary>
+		private void FireAndForgetNfsSync(string baseName, string? fileName, int jobId, bool removeOutput)
+		{
+			_ = Task.Run(async () =>
+			{
+				try
+				{
+					var hostInputDir = Environment.GetEnvironmentVariable("HOST_INPUT_DIR") ?? "";
+					var hostOutputDir = Environment.GetEnvironmentVariable("HOST_OUTPUT_DIR") ?? "";
+					var nfsInputDir = Environment.GetEnvironmentVariable("NFS_INPUT_DIR");
+					var nfsOutputDir = Environment.GetEnvironmentVariable("NFS_OUTPUT_DIR");
+					var syncScript = Environment.GetEnvironmentVariable("NFS_SYNC_SCRIPT");
+
+					if (string.IsNullOrWhiteSpace(nfsInputDir) || string.IsNullOrWhiteSpace(nfsOutputDir))
+					{
+						Console.WriteLine($"[NFS-SYNC] Skipping sync for job {jobId}: NFS dirs not configured.");
+						return;
+					}
+
+					if (string.IsNullOrWhiteSpace(syncScript))
+					{
+						Console.WriteLine($"[NFS-SYNC] Skipping sync for job {jobId}: NFS_SYNC_SCRIPT not configured.");
+						return;
+					}
+
+					var fileArg = string.IsNullOrWhiteSpace(fileName) ? "''" : Quote(fileName);
+					var removeArg = removeOutput ? "true" : "false";
+
+					var dockerArgs =
+						"run --rm --network none " +
+						$"-v {Quote(hostInputDir)}:/local/input " +
+						$"-v {Quote(hostOutputDir)}:/local/output " +
+						$"-v {Quote(nfsInputDir)}:/nfs/input " +
+						$"-v {Quote(nfsOutputDir)}:/nfs/output " +
+						$"-v {Quote(syncScript)}:/sync.sh:ro " +
+						$"alpine sh /sync.sh {Quote(baseName)} {fileArg} {removeArg}";
+
+					Console.WriteLine($"[NFS-SYNC] Starting sync for job {jobId}: baseName={baseName}, fileName={fileName}, removeOutput={removeOutput}");
+
+					var process = new Process
+					{
+						StartInfo = new ProcessStartInfo
+						{
+							FileName = "docker",
+							Arguments = dockerArgs,
+							RedirectStandardOutput = true,
+							RedirectStandardError = true,
+							UseShellExecute = false,
+							CreateNoWindow = true
+						}
+					};
+
+					process.Start();
+					var stdout = await process.StandardOutput.ReadToEndAsync();
+					var stderr = await process.StandardError.ReadToEndAsync();
+					await process.WaitForExitAsync();
+
+					if (process.ExitCode != 0)
+					{
+						Console.WriteLine($"[NFS-SYNC] WARN: Sync failed for job {jobId} (exit {process.ExitCode}). stderr={stderr}");
+					}
+					else
+					{
+						Console.WriteLine($"[NFS-SYNC] Sync completed for job {jobId}. stdout={stdout}");
+					}
+				}
+				catch (Exception ex)
+				{
+					Console.WriteLine($"[NFS-SYNC] ERROR: Exception syncing job {jobId}: {ex.Message}");
+				}
+			});
 		}
 
 		private static string Quote(string s)

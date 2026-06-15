@@ -2,8 +2,9 @@ namespace WrapperApi.Services
 {
     public static class FileService
     {
-        private static readonly string[] AllowedExtensions = new[] { ".json", ".csv", ".dat" };
+        private static readonly string[] AllowedExtensions = new[] { ".json", ".csv", ".dat", ".txt" };
         private static readonly string[] ImageExtensions = new[] { ".tif", ".tiff", ".lif", ".mat" };
+        private const long MaxFileSizeBytes = 100 * 1024 * 1024; // 100 MB — must match FormOptions.MemoryBufferThreshold
 
         public static async Task<string> SaveUploadedFileAsync(IFormFile file, string directory, bool allowImageFiles = false)
         {
@@ -13,15 +14,30 @@ namespace WrapperApi.Services
             if (!allowed.Contains(ext))
                 throw new InvalidOperationException("Unsupported file type.");
 
+            if (file.Length > MaxFileSizeBytes)
+            {
+                var sizeMB = file.Length / (1024.0 * 1024.0);
+                var limitMB = MaxFileSizeBytes / (1024.0 * 1024.0);
+                Console.WriteLine($"[ERROR] File too large: {sizeMB:F1} MB exceeds {limitMB:F0} MB limit for {file.FileName}");
+                throw new InvalidOperationException($"File too large ({sizeMB:F1} MB). Maximum allowed size is {limitMB:F0} MB.");
+            }
+
             var fileName = $"{Guid.NewGuid()}{ext}";
             var filePath = Path.Combine(directory, fileName);
 
+            // Read entire file into memory then write to disk in one shot
+            // to avoid partial-write corruption on volume mounts
+            byte[] fileBytes;
             using (var inputStream = file.OpenReadStream())
-            using (var outputStream = File.Create(filePath))
+            using (var memoryStream = new MemoryStream((int)file.Length))
             {
-                await inputStream.CopyToAsync(outputStream);
-                await outputStream.FlushAsync();
+                await inputStream.CopyToAsync(memoryStream);
+                fileBytes = memoryStream.ToArray();
             }
+
+            Console.WriteLine($"[UPLOAD] Read {fileBytes.Length} bytes into memory for {file.FileName} (expected {file.Length})");
+
+            await File.WriteAllBytesAsync(filePath, fileBytes);
 
             // Verify the file was written correctly
             var writtenSize = new FileInfo(filePath).Length;
@@ -31,6 +47,20 @@ namespace WrapperApi.Services
                 File.Delete(filePath);
                 throw new InvalidOperationException($"File upload failed: size mismatch (expected {file.Length}, wrote {writtenSize}).");
             }
+
+            return fileName;
+        }
+
+        public static string ResolveSourceJobFile(string sourceFilePath, string inputDir)
+        {
+            if (!File.Exists(sourceFilePath))
+                throw new FileNotFoundException($"Source job output file not found: {sourceFilePath}");
+
+            var ext = Path.GetExtension(sourceFilePath);
+            var fileName = $"{Guid.NewGuid()}{ext}";
+            var destPath = Path.Combine(inputDir, fileName);
+
+            File.Copy(sourceFilePath, destPath);
 
             return fileName;
         }
@@ -83,4 +113,3 @@ namespace WrapperApi.Services
         }
     }
 }
-

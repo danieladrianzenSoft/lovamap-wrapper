@@ -50,11 +50,11 @@ namespace WrapperApi.Services
                             return;
                         }
 
-                        // if ((job.Status != JobStatus.Pending) || (job.Status != JobStatus.Failed))
-                        // {
-                        //     Console.WriteLine($"[QUEUE] Job {job.Id} not ready for computation. Skipping.");
-                        //     return;
-                        // }
+                        if (dbJob.Status == JobStatus.Stopped)
+                        {
+                            Console.WriteLine($"[QUEUE] Job {job.Id} was cancelled. Skipping.");
+                            return;
+                        }
 
                         Console.WriteLine($"[QUEUE] Executing job {job.Id} from queue.");
 
@@ -68,7 +68,11 @@ namespace WrapperApi.Services
                             return;
                         }
 
-                        if (!result.Success && result.ShouldRetry && freshJob.RetryCount < freshJob.MaxRetries)
+                        if (freshJob.Status == JobStatus.Stopped)
+                        {
+                            Console.WriteLine($"[QUEUE] Job {freshJob.Id} was cancelled during execution. Not retrying.");
+                        }
+                        else if (!result.Success && result.ShouldRetry && freshJob.RetryCount < freshJob.MaxRetries)
                         {
                             freshJob.RetryCount++;
 

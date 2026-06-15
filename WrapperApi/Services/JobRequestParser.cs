@@ -16,6 +16,17 @@ namespace WrapperApi.Services
             return null;
         }
 
+        public static string? ParseSourceJobId(IFormCollection form)
+        {
+            if (form.TryGetValue("sourceJobId", out var sourceJobIdValue))
+            {
+                var sourceJobId = sourceJobIdValue.ToString()?.Trim();
+                if (!string.IsNullOrWhiteSpace(sourceJobId))
+                    return sourceJobId;
+            }
+            return null;
+        }
+
         public static string ParseDxValue(IFormCollection form, string defaultValue = "4.0")
         {
             return form.TryGetValue("dx", out var dxValue) ? dxValue.ToString() : defaultValue;
@@ -42,6 +53,27 @@ namespace WrapperApi.Services
                 return parsedInt != 0;
 
             var lowered = raw.ToLowerInvariant();
+            return lowered is "y" or "yes" ? true
+                 : lowered is "n" or "no" ? false
+                 : defaultValue;
+        }
+
+        public static bool ParseGenerateParticleMesh(IFormCollection form, bool defaultValue = false)
+        {
+            if (!form.TryGetValue("generateParticleMesh", out var raw))
+                return defaultValue;
+
+            var value = raw.ToString().Trim();
+            if (string.IsNullOrWhiteSpace(value))
+                return defaultValue;
+
+            if (bool.TryParse(value, out var parsedBool))
+                return parsedBool;
+
+            if (int.TryParse(value, out var parsedInt))
+                return parsedInt != 0;
+
+            var lowered = value.ToLowerInvariant();
             return lowered is "y" or "yes" ? true
                  : lowered is "n" or "no" ? false
                  : defaultValue;
